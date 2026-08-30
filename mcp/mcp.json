@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "cluster": {
+      "command": "${LOCARYN_MORPH_ROOT}/bin/locaryn-cluster-mcp",
+      "args": [],
+      "env": {
+        "RUST_LOG": "warn"
+      },
+      "transport": "stdio",
+      "auto_start": true
+    }
+  }
+}

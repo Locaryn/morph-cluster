@@ -1,0 +1,99 @@
+{
+  "$schema": "https://locaryn.dev/schema/morph.json/v0.1",
+  "apiVersion": "0.1",
+  "name": "morph-cluster",
+  "version": "0.1.0",
+  "description": "Mettre en commun la VRAM de plusieurs machines sur le réseau pour faire tourner un modèle trop gros pour une seule carte, par répartition des couches (llama.cpp RPC).",
+  "author": "Locaryn Team",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/Locaryn/morph-cluster",
+  "repository": "https://github.com/Locaryn/morph-cluster",
+  "keywords": [
+    "inference-engine",
+    "distributed-inference",
+    "gpu-cluster",
+    "llama-cpp",
+    "rpc",
+    "vram-pooling"
+  ],
+  "beta": true,
+  "stability": "untested",
+  "permissions": {
+    "mcp": {
+      "reason": "Outils de gestion du cluster : créer, rejoindre, lister les pairs, planifier la répartition, offrir son GPU."
+    },
+    "shell": {
+      "reason": "Lancer llama-server et ggml-rpc-server, et l'agent de mise en réseau du cluster.",
+      "scope": "always"
+    },
+    "network": {
+      "reason": "Découverte des pairs sur le réseau local (diffusion UDP), connexion de contrôle entre machines (TCP), et téléchargement de llama.cpp si absent."
+    },
+    "files.read": {
+      "reason": "Lire les modèles GGUF de la bibliothèque de poids."
+    },
+    "files.write": {
+      "reason": "Installer llama.cpp dans le dossier privé de l'extension, et y garder l'identité du cluster (secret de pairage, liste des pairs connus)."
+    }
+  },
+  "components": {
+    "skills": ["SKILL.md"],
+    "mcp": "mcp/mcp.json"
+  },
+  "capabilities": ["inference-engine"],
+  "engine": {
+    "id": "cluster",
+    "label": "Cluster GPU (llama.cpp RPC)",
+    "driver": "openai_compat",
+    "api_url": "http://127.0.0.1:19190",
+    "port": 19190,
+    "install": {
+      "kind": "binary",
+      "probe_bin": "llama-server"
+    },
+    "lifecycle": {
+      "start": [
+        "{{plugin_bin_dir}}/locaryn-cluster-launch",
+        "serve",
+        "--port",
+        "{{port}}",
+        "--model",
+        "{{model_path}}"
+      ],
+      "env": {
+        "LOCARYN_CLUSTER_ENDPOINT": "{{endpoint}}"
+      },
+      "health": {
+        "method": "GET",
+        "url": "{{endpoint}}/health",
+        "retries": 120,
+        "interval_ms": 5000
+      },
+      "requires_model": true
+    },
+    "model_formats": {
+      "files": ["gguf"],
+      "directories": false,
+      "hf_repo_ids": false
+    },
+    "startup_timeout_secs": 600,
+    "requires": {
+      "note": "Marche sur n'importe quelle machine qui sait lancer llama.cpp ; l'intérêt (mettre en commun la VRAM) demande au moins un pair joignable sur le réseau et un GPU de chaque côté. Sans pair, revient à un llama.cpp local ordinaire."
+    }
+  },
+  "ui_contributions": {
+    "slots": [
+      {
+        "id": "cluster-runtime-card",
+        "slot": "engines.runtimes",
+        "order": 30,
+        "type": "action",
+        "label": "Cluster GPU (llama.cpp RPC)",
+        "icon": "cpu",
+        "category": "Inférence distribuée sur plusieurs machines",
+        "value": "ggml-rpc, découverte réseau, pairage par secret partagé",
+        "hint": "Répartit les couches d'un modèle GGUF entre plusieurs machines pour dépasser la VRAM d'une seule carte."
+      }
+    ]
+  }
+}

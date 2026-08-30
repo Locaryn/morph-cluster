@@ -167,7 +167,7 @@ async fn serve(args: &[String]) -> ExitCode {
         c.args(&cmd_args);
         let erreur = c.exec();
         eprintln!("[cluster] {} : {erreur}", bin.display());
-        return ExitCode::FAILURE;
+        ExitCode::FAILURE
     }
 
     #[cfg(windows)]

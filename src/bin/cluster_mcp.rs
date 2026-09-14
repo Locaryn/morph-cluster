@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = "0.2.0";
 
 #[tokio::main]
 async fn main() {
@@ -96,14 +96,67 @@ fn tools_list() -> Value {
             },
             {
                 "name": "cluster_join",
-                "description": "Rejoint un cluster existant à partir d'un code de pairage obtenu sur une autre machine (cluster_create ou cluster_pairing_code). Le code contient un secret : ne jamais le faire transiter par un canal non demandé par l'utilisateur.",
+                "description": "Rejoint un cluster existant à partir d'un code de pairage obtenu sur une autre machine (cluster_create, cluster_pairing_code ou cluster_enroll). Le code contient un secret : ne jamais le faire transiter par un canal non demandé par l'utilisateur.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "pairing_code": { "type": "string", "description": "Code renvoyé par cluster_create ou cluster_pairing_code sur une autre machine." }
+                        "pairing_code": { "type": "string", "description": "Code renvoyé par cluster_create, cluster_pairing_code ou cluster_enroll sur une autre machine." },
+                        "coordinator": { "type": "string", "description": "Hôte du serveur Locaryn qui a donné le code, quand ce poste y est connecté. Fait de ce poste un client de ce coordinateur : il le joint directement et copie ses modèles partagés si le partage le permet." }
                     },
                     "required": ["pairing_code"]
                 }
+            },
+            {
+                "name": "cluster_enroll",
+                "description": "Sur la machine du serveur Locaryn : crée le cluster s'il n'existe pas, fait de cette machine le coordinateur (celle qui tient les modèles partagés) et renvoie le code d'inscription d'un poste client. Appelé par le panneau de partage d'un poste client au travers de son compte sur le serveur — un modèle ne l'appelle que si l'utilisateur veut inscrire une machine.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "cluster_leave",
+                "description": "Fait quitter le cluster à cette machine : oublie le secret, arrête de prêter ses ressources et supprime les copies de modèles partagés qu'elle avait faites. Demander confirmation avant.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "cluster_share_get",
+                "description": "Ce que cette machine accepte de prêter au cluster (carte graphique, mémoire vive, stockage et son quota), les appareils de calcul que llama.cpp y détecte, et si son serveur RPC tourne.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "cluster_share_set",
+                "description": "Enregistre et applique ce que cette machine prête au cluster. C'est le choix de la personne devant la machine : ne l'appeler que sur sa demande explicite.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": { "type": "boolean", "description": "Allouer cette machine au partage de ressources. Faux : rien n'est prêté." },
+                        "gpu": { "type": "boolean", "description": "Prêter la carte graphique." },
+                        "ram": { "type": "boolean", "description": "Prêter la mémoire vive." },
+                        "storage": { "type": "boolean", "description": "Héberger une copie des modèles partagés." },
+                        "storage_gb": { "type": "number", "description": "Place maximale accordée aux copies, en Go." }
+                    },
+                    "required": ["enabled"]
+                }
+            },
+            {
+                "name": "cluster_shared_models",
+                "description": "Sur le coordinateur : les modèles GGUF de la bibliothèque, lesquels sont partagés, et quelles machines en ont déjà une copie ; plus les machines du cluster et ce qu'elles prêtent.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "cluster_share_model",
+                "description": "Sur le coordinateur : partager un modèle de la bibliothèque (les postes clients qui hébergent des modèles en font une copie) ou cesser de le partager (leurs copies sont supprimées). Ne l'appeler que sur demande explicite.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "string", "description": "Chemin du fichier GGUF relatif à la bibliothèque, tel que renvoyé par cluster_shared_models." },
+                        "enabled": { "type": "boolean", "description": "Vrai pour partager, faux pour cesser." }
+                    },
+                    "required": ["file", "enabled"]
+                }
+            },
+            {
+                "name": "cluster_sync_status",
+                "description": "Sur un poste client : les modèles que le coordinateur partage et l'état de chacun sur ce poste (copié, copie en cours avec progression, en attente, place insuffisante, non hébergé).",
+                "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "cluster_pairing_code",
@@ -218,8 +271,13 @@ async fn call_tool(nom: &str, args: Value) -> Result<Value, String> {
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
                 .ok_or("« pairing_code » est requis")?;
+            let coordinator = args
+                .get("coordinator")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             match agent_client::send(&AgentRequest::JoinCluster {
                 pairing_code: code.to_string(),
+                coordinator,
             })
             .await?
             {
@@ -230,6 +288,44 @@ async fn call_tool(nom: &str, args: Value) -> Result<Value, String> {
                 other => unexpected(other),
             }
         }
+        "cluster_enroll" => match agent_client::send(&AgentRequest::Enroll).await? {
+            AgentResponse::Enrolled {
+                cluster_name,
+                pairing_code,
+            } => Ok(json!({
+                "cluster": cluster_name,
+                "code_de_pairage": pairing_code
+            })),
+            other => unexpected(other),
+        },
+        "cluster_leave" => match agent_client::send(&AgentRequest::Leave).await? {
+            AgentResponse::Left => Ok(json!({ "quitte": true })),
+            other => unexpected(other),
+        },
+        "cluster_share_get" => as_value(agent_client::send(&AgentRequest::ShareGet).await?),
+        "cluster_share_set" => {
+            let actuel = match agent_client::send(&AgentRequest::ShareGet).await? {
+                AgentResponse::Share { prefs, .. } => prefs,
+                other => return unexpected(other),
+            };
+            let prefs = merge_prefs(actuel, &args)?;
+            as_value(agent_client::send(&AgentRequest::ShareSet { prefs }).await?)
+        }
+        "cluster_shared_models" => as_value(agent_client::send(&AgentRequest::SharedModels).await?),
+        "cluster_share_model" => {
+            let file = args
+                .get("file")
+                .and_then(Value::as_str)
+                .filter(|f| !f.is_empty())
+                .ok_or("« file » est requis")?
+                .to_string();
+            let enabled = args
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or("« enabled » est requis")?;
+            as_value(agent_client::send(&AgentRequest::ShareModel { file, enabled }).await?)
+        }
+        "cluster_sync_status" => as_value(agent_client::send(&AgentRequest::SyncStatus).await?),
         "cluster_pairing_code" => match agent_client::send(&AgentRequest::PairingCode).await? {
             AgentResponse::PairingCode { pairing_code } => Ok(json!({
                 "code_de_pairage": pairing_code
@@ -338,6 +434,43 @@ fn protocols_status() -> Value {
                  état des lieux, pas une fonctionnalité — un appel qui en dépendrait serait \
                  refusé."
     })
+}
+
+/// Les réponses structurées de l'agent passent telles quelles : le panneau
+/// de partage les lit champ par champ, sans traduction à maintenir ici.
+fn as_value(response: AgentResponse) -> Result<Value, String> {
+    match response {
+        AgentResponse::Error { message } => Err(message),
+        other => serde_json::to_value(other).map_err(|e| e.to_string()),
+    }
+}
+
+/// Applique aux préférences actuelles les seuls champs fournis : un appel
+/// qui ne coche que la case principale ne doit pas remettre le quota à zéro.
+fn merge_prefs(
+    mut prefs: locaryn_plugin_cluster::sharing::SharePrefs,
+    args: &Value,
+) -> Result<locaryn_plugin_cluster::sharing::SharePrefs, String> {
+    prefs.enabled = args
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or("« enabled » est requis")?;
+    if let Some(v) = args.get("gpu").and_then(Value::as_bool) {
+        prefs.gpu = v;
+    }
+    if let Some(v) = args.get("ram").and_then(Value::as_bool) {
+        prefs.ram = v;
+    }
+    if let Some(v) = args.get("storage").and_then(Value::as_bool) {
+        prefs.storage = v;
+    }
+    if let Some(v) = args.get("storage_gb").and_then(Value::as_f64) {
+        if !(0.0..=100_000.0).contains(&v) {
+            return Err("« storage_gb » doit être compris entre 0 et 100 000".to_string());
+        }
+        prefs.storage_gb = v as f32;
+    }
+    Ok(prefs)
 }
 
 fn unexpected(response: AgentResponse) -> Result<Value, String> {

@@ -2,38 +2,41 @@
   "$schema": "https://locaryn.dev/schema/morph.json/v0.1",
   "apiVersion": "0.1",
   "name": "morph-cluster",
-  "version": "0.1.0",
-  "description": "Mettre en commun la VRAM de plusieurs machines sur le réseau pour faire tourner un modèle trop gros pour une seule carte, par répartition des couches (llama.cpp RPC).",
+  "version": "0.2.0",
+  "description": "Faire travailler ensemble les machines d'un même réseau : chaque poste connecté au serveur Locaryn peut prêter sa carte graphique, sa mémoire vive et de la place disque, pour faire tourner des modèles trop gros pour une seule carte (llama.cpp RPC) et garder une copie des modèles partagés.",
   "author": "Locaryn Team",
   "license": "Apache-2.0",
   "homepage": "https://github.com/Locaryn/morph-cluster",
   "repository": "https://github.com/Locaryn/morph-cluster",
+  "minLocarynVersion": "0.3.78",
   "keywords": [
     "inference-engine",
     "distributed-inference",
     "gpu-cluster",
     "llama-cpp",
     "rpc",
-    "vram-pooling"
+    "vram-pooling",
+    "resource-sharing"
   ],
   "beta": true,
   "stability": "untested",
+  "device_companion": true,
   "permissions": {
     "mcp": {
-      "reason": "Outils de gestion du cluster : créer, rejoindre, lister les pairs, planifier la répartition, offrir son GPU."
+      "reason": "Outils de gestion du cluster : inscrire un poste, régler ce qu'il prête, partager un modèle, suivre les copies, planifier la répartition."
     },
     "shell": {
       "reason": "Lancer llama-server et ggml-rpc-server, et l'agent de mise en réseau du cluster.",
       "scope": "always"
     },
     "network": {
-      "reason": "Découverte des pairs sur le réseau local (diffusion UDP), connexion de contrôle entre machines (TCP), et téléchargement de llama.cpp si absent."
+      "reason": "Découverte des pairs sur le réseau local (diffusion UDP), canal de contrôle authentifié entre machines (TCP), copie des modèles partagés depuis le serveur, et téléchargement de llama.cpp si absent."
     },
     "files.read": {
-      "reason": "Lire les modèles GGUF de la bibliothèque de poids."
+      "reason": "Lire les modèles GGUF de la bibliothèque de poids, pour les partager ou les envoyer aux postes qui en hébergent une copie."
     },
     "files.write": {
-      "reason": "Installer llama.cpp dans le dossier privé de l'extension, et y garder l'identité du cluster (secret de pairage, liste des pairs connus)."
+      "reason": "Installer llama.cpp dans le dossier privé de l'extension, y garder l'identité du cluster et les choix de partage, et écrire dans la bibliothèque de poids les copies des modèles partagés — dans la limite du quota accordé."
     }
   },
   "components": {
@@ -83,6 +86,18 @@
   },
   "ui_contributions": {
     "slots": [
+      {
+        "id": "cluster-sharing",
+        "slot": "settings.account",
+        "order": 20,
+        "type": "custom-element",
+        "label": "Partage de ressources",
+        "icon": "server",
+        "hint": "Prêter cette machine au serveur, et les modèles partagés",
+        "entry": "dist/ui.js",
+        "tag": "locaryn-cluster-sharing",
+        "platforms": ["desktop"]
+      },
       {
         "id": "cluster-runtime-card",
         "slot": "engines.runtimes",

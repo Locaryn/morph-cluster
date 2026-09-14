@@ -1,56 +1,120 @@
 # morph-cluster
 
-Extension Locaryn qui met en commun la **VRAM de plusieurs machines** sur le
-réseau pour faire tourner un modèle GGUF trop gros pour une seule carte —
-par exemple un modèle de 16 Go sur deux GPU de 8 Go.
+Extension Locaryn qui fait **travailler ensemble les machines d'un même
+réseau**. Chaque poste connecté au serveur Locaryn peut prêter sa carte
+graphique, sa mémoire vive et de la place disque. Deux usages :
+
+- **faire tourner un modèle trop gros pour une seule carte** — par exemple un
+  modèle de 16 Go sur deux GPU de 8 Go — en répartissant ses couches entre les
+  machines ;
+- **garder une copie des modèles partagés** sur chaque poste qui l'accepte, pour
+  qu'un modèle activé sur le serveur arrive aussi sur les postes, sans rien
+  télécharger à la main.
 
 Le calcul est fait par **llama.cpp** lui-même : `ggml-rpc-server` sur les
-machines qui prêtent leur GPU, `llama-server --rpc host:port,…` sur celle qui
-pilote la conversation. Ce mécanisme existe dans llama.cpp depuis longtemps ;
-ce que cette extension ajoute, c'est tout ce qui manquait autour — trouver les
-autres machines, s'assurer qu'elles font partie du même cluster avant de leur
-envoyer des couches de poids, calculer combien chacune peut en porter,
-démarrer les bons processus au bon moment.
+machines qui prêtent leurs ressources, `llama-server --rpc host:port,…` sur
+celle qui pilote la conversation. Cette extension ajoute tout ce qui manquait
+autour : l'inscription des postes par le compte Locaryn, le choix de ce que
+chaque machine prête, le catalogue des modèles partagés, leur copie vérifiée,
+et la répartition au démarrage du moteur.
+
+---
+
+## Avec un serveur Locaryn et des postes clients
+
+C'est le parcours prévu. **Tout se fait depuis Réglages → Compte → Partage de
+ressources** ; aucun code n'est à recopier.
+
+1. **Sur la machine serveur** : Réglages → Serveur & fonctions → Serveur actif,
+   comptes créés. Le panneau « Partage de ressources » de cette machine liste
+   sa bibliothèque de modèles, avec un interrupteur par modèle.
+2. **Sur chaque poste client** : se connecter au serveur avec son compte.
+   L'extension est un *compagnon d'appareil* — elle doit tourner sur le poste
+   pour agir sur lui. Le panneau propose de l'installer ici, avec ses
+   autorisations.
+3. **Cocher « Allouer cette machine au partage de ressources »**. Le poste
+   s'inscrit auprès du serveur **par le compte de la personne** : le secret du
+   cluster passe par la connexion chiffrée et authentifiée du compte, jamais
+   par un copier-coller. Puis choisir ce qui est prêté :
+   - **carte graphique** (VRAM) ;
+   - **mémoire vive** — plus lente, mais permet des modèles plus gros ;
+   - **stockage**, avec un quota en Go, pour héberger les modèles partagés.
+4. **Partager un modèle** : un interrupteur, sur le serveur ou depuis n'importe
+   quel poste connecté. Le serveur calcule son empreinte SHA-256 ; chaque poste
+   qui héberge des modèles en fait une copie dans sa bibliothèque, vérifiée
+   avant d'être rendue visible, reprise là où elle s'était arrêtée après une
+   coupure. **Couper le partage retire ces copies.**
+5. **Faire tourner un modèle réparti** : sur le serveur, Réglages → Moteur →
+   « Cluster GPU (llama.cpp RPC) » → un modèle GGUF. Le lanceur retient les
+   postes qui prêtent, dans la limite de ce qu'ils offrent.
+
+Le panneau montre, pour chaque modèle partagé : sa taille, les machines qui en
+ont déjà une copie, et sur un poste client son état ici — installé, copie en
+cours avec sa progression, en attente, place insuffisante (avec ce qui manque).
+
+### Ce qui se passe quand on décoche
+
+- **La case principale** : plus rien n'est prêté ; le serveur RPC s'arrête. Un
+  coordinateur authentifié ne peut plus le redémarrer : appartenir au cluster ne
+  vaut pas consentement à prêter sa machine.
+- **Le stockage** : les copies faites par le cluster sont supprimées. Les
+  modèles que la personne avait posés elle-même ne sont jamais touchés, même
+  sous le même nom — seules les copies inscrites au registre du poste le sont.
+- **« Quitter le cluster »** : oublie le secret, arrête de prêter, supprime les
+  copies.
+
+---
+
+## Sans serveur : le cluster monté à la main
+
+Les outils de la version 0.1 restent là, pour un réseau sans serveur Locaryn :
+`cluster_create` sur une machine (renvoie un code de pairage), `cluster_join`
+avec ce code sur les autres, `cluster_worker_start` sur celles qui prêtent leur
+GPU. Une machine qui n'a jamais enregistré de préférences de partage garde ce
+comportement.
 
 ---
 
 ## Comment ça marche
 
-1. **Une machine crée un cluster** (`cluster_create`) : un nom, un secret
-   généré au hasard. L'outil renvoie un **code de pairage** à copier sur
-   chaque autre machine.
-2. **Chaque autre machine rejoint** (`cluster_join`) avec ce code, puis offre
-   son GPU (`cluster_worker_start`).
-3. **Découverte automatique** : chaque machine diffuse une balise sur le
-   réseau local toutes les cinq secondes. La balise ne révèle qu'une
-   empreinte du cluster — jamais le secret ni son identifiant en clair. Deux
-   machines qui reconnaissent la même empreinte s'authentifient mutuellement
-   par une poignée de main HMAC-SHA256, sans jamais faire transiter le
-   secret lui-même sur le réseau.
-4. **Un pair est une adresse `hôte:port`.** Comment cette adresse est devenue
-   joignable — réseau local, VPN, tunnel personnel — ne regarde pas cette
-   extension. Elle ne connaît, ne nomme et ne dépend d'aucune extension
-   d'accès distant en particulier : si l'adresse est routable, ça marche.
-5. **Choisir le moteur** dans Réglages → Moteur → « Cluster GPU (llama.cpp
-   RPC) » → un modèle GGUF. Le lanceur calcule alors la répartition à partir
-   des pairs joignables, s'assure qu'ils ont démarré leur serveur RPC, et
-   lance `llama-server --rpc …`.
+- **Découverte** : chaque machine diffuse une balise sur le réseau local
+  toutes les cinq secondes. La balise ne révèle qu'une empreinte du cluster —
+  jamais le secret ni son identifiant en clair. Un poste inscrit par le serveur
+  n'en dépend pas : il joint directement l'adresse du serveur, ce qui marche
+  aussi quand la diffusion ne passe pas (Wi-Fi à isolation client).
+- **Authentification** : deux machines s'authentifient mutuellement par une
+  poignée de main HMAC-SHA256, sans faire transiter le secret.
+- **Rafraîchissement** : toutes les quinze secondes, chaque machine relit ses
+  pairs (mémoire libre, ce qu'ils prêtent, modèles hébergés) et oublie ceux qui
+  ne répondent plus depuis 90 s.
+- **Appareils** : la liste vient de `ggml-rpc-server` lui-même, qui connaît les
+  cartes NVIDIA, AMD, Intel et Apple sous le nom exact que `-d` attend. « Carte
+  seule » sur une machine sans carte est refusé plutôt que de laisser llama.cpp
+  se rabattre en silence sur le processeur.
+- **Cache de tenseurs** : sur un poste qui héberge des modèles, `ggml-rpc-server`
+  tourne avec `-c`, son cache rangé dans le dossier de l'extension et non sur
+  le disque système.
 
 ---
 
 ## Sécurité — sans détour
 
-- Le **pairage** (qui peut rejoindre le cluster) est protégé par un secret de
-  32 octets et une poignée de main HMAC-SHA256 mutuelle : ni la balise de
-  découverte ni la poignée de main ne font transiter le secret en clair.
-- **`ggml-rpc-server` lui-même n'a pas d'authentification.** C'est une
-  limite de llama.cpp, pas de cette extension : une fois qu'un serveur RPC
-  tourne, n'importe qui capable d'atteindre son port peut lui parler. Cette
-  extension réduit la fenêtre — le serveur ne tourne que le temps d'une
-  session, sur un port choisi au hasard, communiqué seulement après
-  authentification — mais **n'invente pas une sécurité qui n'existe pas en
-  amont**. Réservez ceci à un réseau de confiance (réseau domestique, votre
-  propre VPN) — jamais à un réseau partagé avec des tiers non fiables.
+- Le **pairage** est protégé par un secret de 32 octets et une poignée de main
+  HMAC-SHA256 mutuelle. Avec un serveur, le secret n'est remis qu'à un compte
+  authentifié du serveur, par sa connexion TLS.
+- Le **catalogue et les copies** ne sont servis qu'aux pairs authentifiés, et
+  uniquement pour les fichiers explicitement partagés : un nom de fichier venu
+  du réseau ne peut ni sortir de la bibliothèque (`../`), ni désigner un modèle
+  non partagé.
+- Le canal de copie est **authentifié mais pas chiffré** : sur un réseau local,
+  un modèle partagé n'est pas un secret. Chaque copie est vérifiée contre
+  l'empreinte SHA-256 du serveur avant d'être utilisable.
+- **`ggml-rpc-server` lui-même n'a pas d'authentification.** C'est une limite
+  de llama.cpp : tant qu'il tourne, n'importe qui capable d'atteindre son port
+  peut lui parler. Il écoute sur un port tiré au hasard, communiqué seulement
+  après authentification, et seulement sur une machine dont la personne a
+  coché le partage — mais **cette extension n'invente pas une sécurité qui
+  n'existe pas en amont**. À réserver à un réseau de confiance.
 
 ---
 
@@ -60,73 +124,35 @@ démarrer les bons processus au bon moment.
 |---|---|
 | **llama.cpp RPC** (`ggml-rpc-server`) | ✅ implémenté — c'est ce que cette extension utilise |
 | Exo (exo-explore) | 📋 à l'étude, aucun code |
-| vLLM multi-nœud (Ray + NCCL) | 📋 à l'étude, aucun code — la piste la plus indiquée pour du matériel identique relié par un lien rapide (plusieurs machines NVIDIA GB10 reliées en ConnectX, par exemple) |
+| vLLM multi-nœud (Ray + NCCL) | 📋 à l'étude, aucun code |
 | Petals / hivemind (DHT) | 📋 à l'étude, aucun code |
-
-L'outil `cluster_protocols` renvoie cet état à jour. Les trois protocoles non
-implémentés n'ont **aucun outil qui prétend les faire fonctionner** — mieux
-vaut un tableau honnête qu'une fonctionnalité qui échoue en silence.
 
 ---
 
 ## Ce que la machine doit offrir
 
-- **llama.cpp** avec le backend RPC (`llama-server` + `ggml-rpc-server`).
-  Cherché dans cet ordre : le dossier privé de l'extension, le dossier
-  `bin/llama/` que l'application gère pour son propre runtime (réutilisé
-  s'il est déjà là), puis le chemin du système. À défaut, l'archive Vulkan
-  officielle est téléchargée automatiquement pour Windows, Linux x86_64,
-  Linux ARM64 (dont les machines NVIDIA GB10) et macOS.
-- Un **GPU** pour prêter de la VRAM — sans, une machine reste utilisable
-  comme pilote (elle calcule sur CPU) mais n'apporte rien au cluster.
-- **Réseau** : diffusion UDP autorisée sur le réseau local pour la
-  découverte automatique (port `41337`), et une connexion TCP directe entre
-  les machines pour le canal de contrôle (port `41338` par défaut) et le
-  serveur RPC (port choisi au hasard, communiqué après authentification).
-
----
-
-## Installation
-
-Réglages → Extensions → Ajouter :
-
-```
-github:Locaryn/morph-cluster@v0.1.0
-```
-
-Accordez ses permissions, activez-la. Voir `SKILL.md` pour l'ordre des
-étapes (créer, rejoindre, planifier, choisir le moteur).
+- **llama.cpp** avec le backend RPC (`llama-server` + `ggml-rpc-server`),
+  cherché dans le dossier privé de l'extension, puis dans `bin/llama/` de
+  l'application, puis sur le chemin du système ; à défaut, l'archive Vulkan
+  officielle est téléchargée pour Windows, Linux x86_64 et ARM64, et macOS.
+- **Réseau** : TCP `41338` entre les machines (contrôle et copie des modèles),
+  UDP `41337` pour la découverte, et le port RPC tiré au hasard.
+- **Locaryn 0.3.78 ou plus récent** pour le panneau de compte, l'inscription
+  par le serveur et l'installation comme compagnon d'appareil.
 
 ---
 
 ## Limites connues, dites clairement
 
-- **Pas de test sur un vrai cluster de plusieurs machines physiques** dans
-  l'environnement où cette extension a été écrite. La logique de pairage
-  (HMAC), le format des messages et le calcul de répartition sont
-  intégralement testés unitairement ; l'échange réseau réel entre deux
-  machines distinctes ne l'a pas été au même degré. Vérifiez sur votre
-  matériel avant d'en dépendre pour un usage important.
-- **La balise de découverte utilise la diffusion limitée** (`255.255.255.255`),
-  qui ne franchit pas les routeurs ni, souvent, les réseaux Wi-Fi « isolation
-  client » de certains routeurs grand public. Sur un réseau où la diffusion
-  ne passe pas, deux machines pourtant joignables ne se découvriront pas
-  automatiquement — il n'y a pas aujourd'hui de moyen d'ajouter un pair par
-  adresse manuelle.
-- **Seul le format GGUF** est pris en charge — c'est ce que `llama-server`
-  sait charger.
-
----
-
-## Un bogue trouvé en chemin, signalé et non corrigé ici
-
-L'installateur natif de llama.cpp de l'application principale demande, pour
-Linux, une archive `.zip` qui n'existe plus sous ce nom dans les publications
-récentes de llama.cpp (seule une `.tar.gz` est publiée) — l'installation
-automatique du runtime intégré échoue donc aujourd'hui sur Linux. Cette
-extension n'en dépend pas (elle gère son propre téléchargement, avec la bonne
-extension par plateforme), mais le bogue touche le runtime natif de
-l'application, hors du périmètre de cette extension.
+- **Pas encore éprouvé sur un vrai parc de plusieurs machines physiques.** La
+  poignée de main, le format des messages, la répartition, le plan de copie et
+  la copie elle-même (reprise, vérification, refus hors catalogue) sont testés
+  automatiquement, dont une copie réelle de bout en bout sur la boucle locale.
+  L'échange entre deux machines distinctes ne l'a pas été au même degré.
+- **Une seule copie à la fois** par poste, dans l'ordre du catalogue.
+- **La mémoire vive prêtée n'a pas de plafond** : llama.cpp n'offre pas d'option
+  pour la limiter, et annonce la mémoire libre au moment du chargement.
+- **Seul le format GGUF** est pris en charge.
 
 ---
 
@@ -141,13 +167,11 @@ cargo clippy --all-targets --locked -- -D warnings
 Trois exécutables dans `bin/` :
 
 - `locaryn-cluster-agent` — le processus de fond : découverte, pairage,
-  démarrage à la demande de `ggml-rpc-server`.
-- `locaryn-cluster-mcp` — les outils.
+  serveur RPC prêté, catalogue, copies.
+- `locaryn-cluster-mcp` — les outils, et ce que le panneau appelle.
 - `locaryn-cluster-launch` — nommé par `engine.lifecycle.start`.
 
-`bin/` est ignoré par Git — l'archive des sources d'un dépôt GitHub ne le
-contient donc pas. La CI compile par plateforme et publie une archive nommée
-avec l'OS et l'architecture ; l'application cherche ce paquet en premier.
+Le panneau est `dist/ui.js`, un élément personnalisé sans dépendance.
 
 ---
 

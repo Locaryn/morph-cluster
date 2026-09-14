@@ -42,7 +42,35 @@ pub enum AgentRequest {
     /// Rejoint un cluster existant à partir d'un code de pairage.
     JoinCluster {
         pairing_code: String,
+        /// L'hôte du coordinateur, quand le code vient du serveur Locaryn
+        /// auquel ce poste est connecté : l'agent le joint directement, sans
+        /// attendre une balise que le réseau ne laisse pas toujours passer.
+        #[serde(default)]
+        coordinator: Option<String>,
     },
+    /// Sur la machine du serveur Locaryn : crée le cluster s'il n'existe pas,
+    /// se déclare coordinateur, et renvoie de quoi inscrire un poste client.
+    Enroll,
+    /// Quitte le cluster : oublie son identité, arrête de prêter, supprime
+    /// les copies de modèles partagés faites par ce poste.
+    Leave,
+    /// Les préférences de partage de cette machine et ce qu'elles donnent.
+    ShareGet,
+    /// Enregistre les préférences de partage et les applique aussitôt.
+    ShareSet {
+        prefs: crate::sharing::SharePrefs,
+    },
+    /// Sur le coordinateur : la bibliothèque, ce qui en est partagé, et
+    /// quelles machines en ont une copie.
+    SharedModels,
+    /// Sur le coordinateur : partager ou cesser de partager un modèle.
+    ShareModel {
+        file: String,
+        enabled: bool,
+    },
+    /// Sur un poste client : le catalogue du coordinateur et l'état de
+    /// chaque modèle sur ce poste.
+    SyncStatus,
     /// Le code de pairage courant, pour le partager avec une autre machine.
     PairingCode,
     /// Les pairs actuellement connus, avec leur dernière capacité rafraîchie.
@@ -98,10 +126,76 @@ pub enum AgentResponse {
         peer_id: String,
         round_trip_ms: u32,
     },
+    Enrolled {
+        cluster_name: String,
+        pairing_code: String,
+    },
+    Left,
+    Share {
+        prefs: crate::sharing::SharePrefs,
+        /// Les appareils que llama.cpp voit sur cette machine.
+        devices: Vec<crate::sharing::RpcDevice>,
+        worker_active: bool,
+        rpc_port: Option<u16>,
+        /// Ce qui empêche de prêter, quand la case est cochée mais que rien
+        /// ne tourne.
+        problem: Option<String>,
+    },
+    SharedModels {
+        models: Vec<SharedModelView>,
+        members: Vec<MemberView>,
+    },
+    Sync {
+        coordinator: Option<String>,
+        /// La dernière lecture du catalogue a-t-elle abouti ?
+        reachable: bool,
+        models: Vec<SyncEntry>,
+        used_bytes: u64,
+        quota_bytes: u64,
+        last_error: Option<String>,
+    },
     ShuttingDown,
     Error {
         message: String,
     },
+}
+
+/// Un modèle de la bibliothèque du coordinateur, vu depuis le panneau.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedModelView {
+    pub file: String,
+    pub size_bytes: u64,
+    pub shared: bool,
+    /// L'empreinte est calculée : les postes peuvent le copier.
+    pub ready_to_copy: bool,
+    /// Les machines qui en ont une copie complète.
+    pub hosted_by: Vec<String>,
+}
+
+/// Une machine du cluster, vue depuis le coordinateur.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberView {
+    pub name: String,
+    pub address: String,
+    pub sharing: bool,
+    pub gpu: bool,
+    pub ram: bool,
+    pub storage: bool,
+    pub lendable_gb: f32,
+    pub last_seen_unix: u64,
+}
+
+/// L'état d'un modèle partagé sur ce poste.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncEntry {
+    pub file: String,
+    pub size_bytes: u64,
+    #[serde(flatten)]
+    pub state: crate::catalog::LocalState,
+    /// Octets déjà sur le disque pendant une copie.
+    pub copied_bytes: u64,
+    /// La copie en cours, s'il y en a une.
+    pub downloading: bool,
 }
 
 /// Encode une requête en une ligne JSON terminée par `\n`.

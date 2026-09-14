@@ -1,6 +1,7 @@
 //! Agent Cluster — le processus de fond qui fait exister le réseau du
-//! cluster : balise UDP, écoute des pairs, poignée de main HMAC, démarrage à
-//! la demande de `ggml-rpc-server`.
+//! cluster : balise UDP, écoute des pairs, poignée de main HMAC, serveur RPC
+//! prêté selon les préférences de la machine, catalogue des modèles partagés
+//! et copie de ces modèles sur les postes clients.
 //!
 //! Démarré une fois (par le serveur MCP, au premier outil appelé), il tourne
 //! ensuite tant que Locaryn tourne. Le serveur MCP et le lanceur du moteur
@@ -11,45 +12,103 @@
 //!   adressent, jamais un pair.
 //! - **cluster** (port fixe [`DEFAULT_CONTROL_PORT`], visible du réseau) :
 //!   les autres machines s'y présentent, après la balise UDP qui les a fait
-//!   se reconnaître.
+//!   se reconnaître — ou directement, pour un poste inscrit par le serveur.
+//!
+//! Deux rôles possibles, jamais les deux :
+//! - **coordinateur** : la machine du serveur Locaryn. Elle tient le
+//!   catalogue des modèles partagés et les envoie à qui les demande.
+//! - **poste client** : une machine connectée à ce serveur. Si la personne l'a
+//!   permis, elle prête sa carte, sa mémoire, et héberge une copie des
+//!   modèles partagés dans la limite de son quota.
 
 use locaryn_plugin_cluster as cluster;
-use locaryn_plugin_cluster::agent_protocol::{self, AgentHandle, AgentRequest, AgentResponse};
+use locaryn_plugin_cluster::agent_protocol::{
+    self, AgentHandle, AgentRequest, AgentResponse, MemberView, SharedModelView, SyncEntry,
+};
+use locaryn_plugin_cluster::catalog::{self, Catalog, LocalState, SharedModel, SyncLedger};
 use locaryn_plugin_cluster::discovery::{
     Beacon, CapabilityAnnounce, ControlRequest, ControlResponse,
 };
-use locaryn_plugin_cluster::hmac_auth::{InitiatorHandshake, ResponderHandshake};
+use locaryn_plugin_cluster::hmac_auth::ResponderHandshake;
 use locaryn_plugin_cluster::identity::ClusterIdentity;
-use locaryn_plugin_cluster::{Capability, Peer};
-use std::collections::HashMap;
+use locaryn_plugin_cluster::peer_channel::{self, read_json_line, write_json_line};
+use locaryn_plugin_cluster::sharing::{self, RpcDevice, SharePrefs, SharingAnnounce};
+use locaryn_plugin_cluster::{transfer, Capability, Peer};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::process::Child;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+
+/// Un pair qui n'a pas répondu depuis ce délai est oublié : il réapparaîtra
+/// à sa prochaine balise ou à sa prochaine connexion.
+const OUBLI_PAIR_SECS: u64 = 90;
 
 struct AgentState {
     identity: Option<ClusterIdentity>,
     peers: HashMap<String, Peer>,
     rpc_child: Option<Child>,
     rpc_port: Option<u16>,
+    /// `None` : aucun choix enregistré (cluster monté à la main).
+    prefs: Option<SharePrefs>,
+    /// Les appareils que llama.cpp voit, lus une fois puis à la demande.
+    devices: Vec<RpcDevice>,
+    /// Les appareils passés à `-d` au dernier démarrage du serveur RPC.
+    lent: Vec<String>,
+    /// Pourquoi rien n'est prêté alors que la case est cochée.
+    worker_problem: Option<String>,
+    /// Coordinateur : le sien. Poste client : la dernière copie lue.
+    catalog: Catalog,
+    catalog_reachable: bool,
+    sync_error: Option<String>,
+    downloading: Option<(String, Arc<AtomicU64>)>,
+    /// Les empreintes en cours de calcul, pour ne pas lancer deux lectures
+    /// de 16 Go du même fichier.
+    hashing: HashSet<String>,
 }
 
 type Shared = Arc<Mutex<AgentState>>;
+
+#[derive(Clone)]
+struct Agent {
+    state: Shared,
+    /// Réveille la synchronisation dès qu'un choix change, sans attendre le
+    /// prochain passage.
+    wake: Arc<Notify>,
+}
 
 #[tokio::main]
 async fn main() {
     let state_dir = cluster::state_dir();
     let _ = std::fs::create_dir_all(&state_dir);
 
-    let identity = ClusterIdentity::load(&state_dir);
-    let state: Shared = Arc::new(Mutex::new(AgentState {
-        identity,
-        peers: HashMap::new(),
-        rpc_child: None,
-        rpc_port: None,
-    }));
+    let prefs = SharePrefs::load(&state_dir);
+    let catalog = if prefs.as_ref().is_some_and(|p| p.coordinator) {
+        Catalog::load(&state_dir)
+    } else {
+        Catalog::default()
+    };
+    let agent = Agent {
+        state: Arc::new(Mutex::new(AgentState {
+            identity: ClusterIdentity::load(&state_dir),
+            peers: HashMap::new(),
+            rpc_child: None,
+            rpc_port: None,
+            prefs,
+            devices: Vec::new(),
+            lent: Vec::new(),
+            worker_problem: None,
+            catalog,
+            catalog_reachable: false,
+            sync_error: None,
+            downloading: None,
+            hashing: HashSet::new(),
+        })),
+        wake: Arc::new(Notify::new()),
+    };
 
     // Canal local : boucle locale, port choisi par le système. Le serveur MCP
     // et le lanceur le lisent depuis `agent.json`, jamais deviné.
@@ -89,10 +148,21 @@ async fn main() {
         handle.pid
     );
 
-    tokio::spawn(run_local_ipc(local_listener, state.clone()));
-    tokio::spawn(run_peer_listener(peer_listener, state.clone()));
-    tokio::spawn(run_beacon_sender(peer_port, state.clone()));
-    tokio::spawn(run_beacon_listener(state.clone()));
+    tokio::spawn(run_local_ipc(local_listener, agent.clone()));
+    tokio::spawn(run_peer_listener(peer_listener, agent.clone()));
+    tokio::spawn(run_beacon_sender(peer_port, agent.state.clone()));
+    tokio::spawn(run_beacon_listener(agent.clone()));
+    tokio::spawn(run_peer_refresh(agent.clone()));
+    tokio::spawn(run_sync(agent.clone()));
+
+    // Ce que les préférences enregistrées demandent : prêter dès le démarrage,
+    // recalculer les empreintes que la dernière session n'a pas finies.
+    let demarrage = agent.clone();
+    tokio::spawn(async move {
+        refresh_devices(&demarrage.state).await;
+        apply_prefs(&demarrage.state).await;
+        rehash_catalog(&demarrage.state).await;
+    });
 
     // Le processus vit tant qu'on ne lui demande pas explicitement de
     // s'arrêter (requête `Shutdown` sur le canal local) ou qu'un signal
@@ -106,12 +176,12 @@ async fn main() {
 // Canal local : réponses aux commandes du serveur MCP et du lanceur.
 // ============================================================================
 
-async fn run_local_ipc(listener: TcpListener, state: Shared) {
+async fn run_local_ipc(listener: TcpListener, agent: Agent) {
     loop {
         let Ok((socket, _)) = listener.accept().await else {
             continue;
         };
-        let state = state.clone();
+        let agent = agent.clone();
         tokio::spawn(async move {
             let (read_half, mut write_half) = socket.into_split();
             let mut lines = BufReader::new(read_half).lines();
@@ -120,7 +190,7 @@ async fn run_local_ipc(listener: TcpListener, state: Shared) {
                     continue;
                 }
                 let response = match serde_json::from_str::<AgentRequest>(&line) {
-                    Ok(req) => handle_local_request(req, &state).await,
+                    Ok(req) => handle_local_request(req, &agent).await,
                     Err(e) => AgentResponse::Error {
                         message: format!("requête illisible : {e}"),
                     },
@@ -137,14 +207,16 @@ async fn run_local_ipc(listener: TcpListener, state: Shared) {
     }
 }
 
-async fn handle_local_request(req: AgentRequest, state: &Shared) -> AgentResponse {
+async fn handle_local_request(req: AgentRequest, agent: &Agent) -> AgentResponse {
+    let state = &agent.state;
     match req {
         AgentRequest::Status => {
+            let capability = local_capability(state).await;
             let s = state.lock().await;
             AgentResponse::Status {
                 cluster_name: s.identity.as_ref().map(|i| i.name.clone()),
                 cluster_id: s.identity.as_ref().map(|i| i.cluster_id.clone()),
-                self_capability: local_capability(s.rpc_port.is_some()).await,
+                self_capability: capability,
                 worker_active: s.rpc_child.is_some(),
                 rpc_port: s.rpc_port,
                 peer_count: s.peers.len(),
@@ -163,23 +235,10 @@ async fn handle_local_request(req: AgentRequest, state: &Shared) -> AgentRespons
             s.peers.clear();
             AgentResponse::Created { pairing_code: code }
         }
-        AgentRequest::JoinCluster { pairing_code } => {
-            match ClusterIdentity::from_pairing_code(&pairing_code) {
-                Ok(identity) => {
-                    if let Err(e) = identity.save(&cluster::state_dir()) {
-                        return AgentResponse::Error {
-                            message: format!("identité impossible à enregistrer : {e}"),
-                        };
-                    }
-                    let name = identity.name.clone();
-                    let mut s = state.lock().await;
-                    s.identity = Some(identity);
-                    s.peers.clear();
-                    AgentResponse::Joined { cluster_name: name }
-                }
-                Err(message) => AgentResponse::Error { message },
-            }
-        }
+        AgentRequest::JoinCluster {
+            pairing_code,
+            coordinator,
+        } => join_cluster(agent, &pairing_code, coordinator).await,
         AgentRequest::PairingCode => {
             let s = state.lock().await;
             match &s.identity {
@@ -201,99 +260,300 @@ async fn handle_local_request(req: AgentRequest, state: &Shared) -> AgentRespons
         AgentRequest::WorkerStart => start_worker(state).await,
         AgentRequest::WorkerStop => stop_worker(state).await,
         AgentRequest::Plan { model_size_gb } => {
-            let s = state.lock().await;
-            let local_vram = local_capability(s.rpc_port.is_some()).await.free_vram_gb;
-            let peers: Vec<Peer> = s.peers.values().cloned().collect();
-            drop(s);
+            let local_vram = local_capability(state).await.free_vram_gb;
+            let peers: Vec<Peer> = state.lock().await.peers.values().cloned().collect();
             let plan = cluster::plan::compute(model_size_gb, local_vram, &peers, None);
             AgentResponse::Plan { plan }
         }
         AgentRequest::Bench { peer_id } => bench_peer(&peer_id, state).await,
-        AgentRequest::Shutdown => AgentResponse::ShuttingDown,
-    }
-}
-
-// ============================================================================
-// Capacités locales : GPU, VRAM libre, présence des binaires llama.cpp.
-// ============================================================================
-
-async fn local_capability(worker_active: bool) -> Capability {
-    let (gpu_name, free_vram_gb) = probe_gpu().await;
-    let has_llama_server = cluster::launch::find_binary("llama-server").is_some();
-    let has_rpc_server = worker_active || cluster::launch::find_binary("ggml-rpc-server").is_some();
-    Capability {
-        name: hostname(),
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        gpu_name,
-        free_vram_gb,
-        has_llama_server,
-        has_rpc_server,
-    }
-}
-
-fn hostname() -> String {
-    #[cfg(windows)]
-    {
-        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "machine".to_string())
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var("HOSTNAME")
-            .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
-            .unwrap_or_else(|_| "machine".to_string())
-    }
-}
-
-/// Interroge `nvidia-smi` pour la VRAM **libre** — pas la VRAM totale, qui ne
-/// dit rien de ce qu'un autre modèle occupe déjà. À défaut de `nvidia-smi`
-/// sur le chemin, retombe sur `LOCARYN_VRAM_GB` (la VRAM totale mesurée par
-/// l'hôte à l'installation de l'extension) en le disant dans le nom : mieux
-/// vaut un nombre pessimiste et signalé qu'un nombre inventé.
-async fn probe_gpu() -> (Option<String>, f32) {
-    let sortie = tokio::process::Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,memory.free",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .await;
-    if let Ok(o) = sortie {
-        if o.status.success() {
-            let texte = String::from_utf8_lossy(&o.stdout);
-            if let Some(ligne) = texte.lines().next() {
-                let mut parts = ligne.split(',');
-                let nom = parts.next().map(|s| s.trim().to_string());
-                let mio: Option<f32> = parts.next().and_then(|s| s.trim().parse().ok());
-                if let (Some(nom), Some(mio)) = (nom, mio) {
-                    return (Some(nom), mio / 1024.0);
-                }
+        AgentRequest::Enroll => enroll(state).await,
+        AgentRequest::Leave => leave(agent).await,
+        AgentRequest::ShareGet => {
+            if state.lock().await.devices.is_empty() {
+                refresh_devices(state).await;
             }
+            share_view(state).await
+        }
+        AgentRequest::ShareSet { prefs } => set_prefs(agent, prefs).await,
+        AgentRequest::SharedModels => shared_models_view(state).await,
+        AgentRequest::ShareModel { file, enabled } => share_model(state, &file, enabled).await,
+        AgentRequest::SyncStatus => sync_view(state).await,
+        AgentRequest::Shutdown => {
+            stop_worker(state).await;
+            AgentResponse::ShuttingDown
         }
     }
-    let total = std::env::var("LOCARYN_VRAM_GB")
-        .ok()
-        .and_then(|s| s.parse::<f32>().ok());
-    (None, total.unwrap_or(0.0))
 }
 
 // ============================================================================
-// Serveur RPC local : offrir son GPU au cluster.
+// Inscription : rejoindre, coordonner, quitter.
 // ============================================================================
 
-async fn start_worker(state: &Shared) -> AgentResponse {
+async fn join_cluster(agent: &Agent, code: &str, coordinator: Option<String>) -> AgentResponse {
+    let identity = match ClusterIdentity::from_pairing_code(code) {
+        Ok(i) => i,
+        Err(message) => return AgentResponse::Error { message },
+    };
+    let dir = cluster::state_dir();
+    if let Err(e) = identity.save(&dir) {
+        return AgentResponse::Error {
+            message: format!("identité impossible à enregistrer : {e}"),
+        };
+    }
+    let name = identity.name.clone();
+    let hote = coordinator
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty());
     {
+        let mut s = agent.state.lock().await;
+        let meme_cluster = s
+            .identity
+            .as_ref()
+            .is_some_and(|i| i.cluster_id == identity.cluster_id);
+        s.identity = Some(identity);
+        if !meme_cluster {
+            s.peers.clear();
+        }
+        if let Some(hote) = &hote {
+            let mut prefs = s.prefs.clone().unwrap_or_default();
+            prefs.coordinator_host = Some(hote.clone());
+            prefs.coordinator = false;
+            if let Err(e) = prefs.save(&dir) {
+                return AgentResponse::Error {
+                    message: format!("préférences impossibles à enregistrer : {e}"),
+                };
+            }
+            s.prefs = Some(prefs);
+        }
+    }
+    if let Some(hote) = hote {
+        let adresse = control_address(&hote);
+        let state = agent.state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = pair_with(&adresse, &state).await {
+                eprintln!("[cluster-agent] coordinateur {adresse} injoignable : {e}");
+            }
+        });
+    }
+    agent.wake.notify_one();
+    AgentResponse::Joined { cluster_name: name }
+}
+
+async fn enroll(state: &Shared) -> AgentResponse {
+    let dir = cluster::state_dir();
+    let mut s = state.lock().await;
+    if s.identity.is_none() {
+        let identity = ClusterIdentity::generate(&hostname());
+        if let Err(e) = identity.save(&dir) {
+            return AgentResponse::Error {
+                message: format!("identité impossible à enregistrer : {e}"),
+            };
+        }
+        s.identity = Some(identity);
+    }
+    let mut prefs = s.prefs.clone().unwrap_or_default();
+    if !prefs.coordinator {
+        prefs.coordinator = true;
+        prefs.coordinator_host = None;
+        if let Err(e) = prefs.save(&dir) {
+            return AgentResponse::Error {
+                message: format!("préférences impossibles à enregistrer : {e}"),
+            };
+        }
+        s.catalog = Catalog::load(&dir);
+    }
+    s.prefs = Some(prefs);
+    let identity = s.identity.as_ref().expect("identité posée juste au-dessus");
+    AgentResponse::Enrolled {
+        cluster_name: identity.name.clone(),
+        pairing_code: identity.pairing_code(),
+    }
+}
+
+async fn leave(agent: &Agent) -> AgentResponse {
+    stop_worker(&agent.state).await;
+    let dir = cluster::state_dir();
+    let _ = std::fs::remove_file(dir.join("identity.json"));
+    {
+        let mut s = agent.state.lock().await;
+        s.identity = None;
+        s.peers.clear();
+        s.catalog = Catalog::default();
+        s.catalog_reachable = false;
+        s.sync_error = None;
+        let mut prefs = s.prefs.clone().unwrap_or_default();
+        prefs.enabled = false;
+        prefs.coordinator = false;
+        prefs.coordinator_host = None;
+        let _ = prefs.save(&dir);
+        s.prefs = Some(prefs);
+    }
+    remove_synced_copies(None).await;
+    agent.wake.notify_one();
+    AgentResponse::Left
+}
+
+fn control_address(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') && host.matches(':').count() == 1 {
+        host.to_string()
+    } else {
+        format!("{host}:{}", cluster::DEFAULT_CONTROL_PORT)
+    }
+}
+
+// ============================================================================
+// Partage de ressources : préférences, appareils, serveur RPC.
+// ============================================================================
+
+async fn set_prefs(agent: &Agent, mut prefs: SharePrefs) -> AgentResponse {
+    let dir = cluster::state_dir();
+    {
+        let mut s = agent.state.lock().await;
+        // Le rôle ne se choisit pas depuis le panneau : il vient de
+        // l'inscription. Un panneau ancien qui renverrait ces champs ne peut
+        // pas faire d'un poste client un coordinateur.
+        if let Some(anciennes) = &s.prefs {
+            prefs.coordinator = anciennes.coordinator;
+            prefs.coordinator_host = anciennes.coordinator_host.clone();
+        } else {
+            prefs.coordinator = false;
+            prefs.coordinator_host = None;
+        }
+        prefs.storage_gb = prefs.storage_gb.clamp(0.0, 100_000.0);
+        if let Err(e) = prefs.save(&dir) {
+            return AgentResponse::Error {
+                message: format!("préférences impossibles à enregistrer : {e}"),
+            };
+        }
+        s.prefs = Some(prefs);
+    }
+    if agent.state.lock().await.devices.is_empty() {
+        refresh_devices(&agent.state).await;
+    }
+    apply_prefs(&agent.state).await;
+    agent.wake.notify_one();
+    share_view(&agent.state).await
+}
+
+/// Met le serveur RPC en accord avec les préférences : le démarre, l'arrête,
+/// ou le relance si le choix des appareils a changé.
+async fn apply_prefs(state: &Shared) {
+    let (prefs, actif, lent_actuel, devices) = {
         let s = state.lock().await;
+        (
+            s.prefs.clone(),
+            s.rpc_child.is_some(),
+            s.lent.clone(),
+            s.devices.clone(),
+        )
+    };
+    let Some(prefs) = prefs else {
+        return;
+    };
+    if !prefs.lends_compute() {
+        if actif {
+            stop_worker(state).await;
+        }
+        state.lock().await.worker_problem = None;
+        return;
+    }
+    let voulus = sharing::devices_to_lend(&prefs, &devices).unwrap_or_default();
+    if actif && voulus == lent_actuel {
+        return;
+    }
+    if actif {
+        stop_worker(state).await;
+    }
+    if let AgentResponse::Error { message } = start_worker(state).await {
+        state.lock().await.worker_problem = Some(message);
+    }
+}
+
+/// Demande à `ggml-rpc-server` la liste de ses appareils.
+///
+/// Il n'a pas d'option pour la lister : nommer un appareil qui n'existe pas
+/// lui fait imprimer la liste complète avant de refuser — sans rien ouvrir
+/// sur le réseau.
+async fn refresh_devices(state: &Shared) {
+    let Some(bin) = cluster::launch::find_binary("ggml-rpc-server") else {
+        return;
+    };
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.args(["-d", "locaryn-liste-des-appareils"])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    cluster::launch::hide_console(&mut cmd);
+    let Ok(Ok(sortie)) = tokio::time::timeout(Duration::from_secs(30), cmd.output()).await else {
+        return;
+    };
+    let texte = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&sortie.stdout),
+        String::from_utf8_lossy(&sortie.stderr)
+    );
+    let devices = sharing::parse_device_list(&texte);
+    if !devices.is_empty() {
+        state.lock().await.devices = devices;
+    }
+}
+
+async fn share_view(state: &Shared) -> AgentResponse {
+    let mut s = state.lock().await;
+    reap_worker(&mut s);
+    AgentResponse::Share {
+        prefs: s.prefs.clone().unwrap_or_default(),
+        devices: s.devices.clone(),
+        worker_active: s.rpc_child.is_some(),
+        rpc_port: s.rpc_port,
+        problem: s.worker_problem.clone(),
+    }
+}
+
+/// Oublie un serveur RPC mort de lui-même, pour ne pas annoncer un port qui
+/// ne répond plus.
+fn reap_worker(s: &mut AgentState) {
+    if let Some(child) = s.rpc_child.as_mut() {
+        if let Ok(Some(statut)) = child.try_wait() {
+            s.rpc_child = None;
+            s.rpc_port = None;
+            s.lent.clear();
+            s.worker_problem = Some(format!("ggml-rpc-server s'est arrêté ({statut})"));
+        }
+    }
+}
+
+async fn start_worker(state: &Shared) -> AgentResponse {
+    let (prefs, devices) = {
+        let mut s = state.lock().await;
+        reap_worker(&mut s);
         if let Some(port) = s.rpc_port {
             return AgentResponse::WorkerStarted { port };
         }
-    }
+        (s.prefs.clone(), s.devices.clone())
+    };
     let Some(bin) = cluster::launch::find_binary("ggml-rpc-server") else {
         return AgentResponse::Error {
             message: "ggml-rpc-server introuvable — installez llama.cpp (cluster_status en dit \
                       plus) avant d'offrir cette machine au cluster"
                 .to_string(),
         };
+    };
+    // Avec des préférences enregistrées, on prête exactement ce qui est
+    // coché. Sans, c'est le cluster monté à la main : llama.cpp choisit.
+    let lent = match &prefs {
+        Some(p) if p.enabled => {
+            if devices.is_empty() {
+                return AgentResponse::Error {
+                    message: "appareils de calcul non détectés — llama.cpp n'a rien répondu"
+                        .to_string(),
+                };
+            }
+            match sharing::devices_to_lend(p, &devices) {
+                Ok(noms) => noms,
+                Err(message) => return AgentResponse::Error { message },
+            }
+        }
+        _ => Vec::new(),
     };
     // Port choisi par le système : deviné, il serait joignable par n'importe
     // qui sur le réseau avant même qu'un coordinateur authentifié ne le
@@ -313,19 +573,43 @@ async fn start_worker(state: &Shared) -> AgentResponse {
     cmd.args(["--host", "0.0.0.0", "--port", &port.to_string()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    cluster::launch::hide_console(&mut cmd);
-    match cmd.spawn() {
-        Ok(child) => {
-            let mut s = state.lock().await;
-            s.rpc_child = Some(child);
-            s.rpc_port = Some(port);
-            AgentResponse::WorkerStarted { port }
-        }
-        Err(e) => AgentResponse::Error {
-            message: format!("{} : {e}", bin.display()),
-        },
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    if !lent.is_empty() {
+        cmd.args(["-d", &lent.join(",")]);
     }
+    // Le cache de tenseurs de llama.cpp rend un rechargement du même modèle
+    // presque instantané. Il n'a sa place que sur une machine qui accepte
+    // d'héberger des modèles, et dans le dossier de l'extension — sinon il
+    // remplit `%LOCALAPPDATA%` ou `~/.cache` sur le disque système.
+    if prefs.as_ref().is_some_and(SharePrefs::hosts_models) {
+        let cache = cluster::extension_data_dir().join("rpc-cache");
+        let _ = std::fs::create_dir_all(&cache);
+        cmd.arg("-c").env("LLAMA_CACHE", &cache);
+    }
+    cluster::launch::hide_console(&mut cmd);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return AgentResponse::Error {
+                message: format!("{} : {e}", bin.display()),
+            }
+        }
+    };
+    // Un appareil refusé ou un port pris font sortir le programme aussitôt :
+    // mieux vaut le voir ici qu'annoncer un port mort aux autres machines.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    if let Ok(Some(statut)) = child.try_wait() {
+        return AgentResponse::Error {
+            message: format!("ggml-rpc-server s'est arrêté au démarrage ({statut})"),
+        };
+    }
+    let mut s = state.lock().await;
+    s.rpc_child = Some(child);
+    s.rpc_port = Some(port);
+    s.lent = lent;
+    s.worker_problem = None;
+    AgentResponse::WorkerStarted { port }
 }
 
 async fn stop_worker(state: &Shared) -> AgentResponse {
@@ -334,7 +618,559 @@ async fn stop_worker(state: &Shared) -> AgentResponse {
         let _ = child.kill().await;
     }
     s.rpc_port = None;
+    s.lent.clear();
     AgentResponse::WorkerStopped
+}
+
+// ============================================================================
+// Capacités locales : GPU, VRAM libre, présence des binaires llama.cpp.
+// ============================================================================
+
+async fn local_capability(state: &Shared) -> Capability {
+    let (worker_active, devices, lent) = {
+        let mut s = state.lock().await;
+        reap_worker(&mut s);
+        (s.rpc_child.is_some(), s.devices.clone(), s.lent.clone())
+    };
+    let (gpu_name, free_vram_gb) = probe_gpu(&devices).await;
+    Capability {
+        name: hostname(),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        gpu_name,
+        free_vram_gb,
+        has_llama_server: cluster::launch::find_binary("llama-server").is_some(),
+        has_rpc_server: worker_active || cluster::launch::find_binary("ggml-rpc-server").is_some(),
+        offered_memory_gb: if worker_active {
+            sharing::offered_memory_gb(&devices, &lent)
+        } else {
+            0.0
+        },
+    }
+}
+
+fn hostname() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "machine".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOSTNAME")
+            .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+            .unwrap_or_else(|_| "machine".to_string())
+    }
+}
+
+/// La VRAM **libre** — pas la VRAM totale, qui ne dit rien de ce qu'un autre
+/// modèle occupe déjà.
+///
+/// Dans l'ordre : `nvidia-smi`, puis la liste des appareils de llama.cpp (qui
+/// connaît aussi les cartes AMD, Intel et Apple), puis `LOCARYN_VRAM_GB` (la
+/// VRAM totale mesurée par l'hôte) — mieux vaut un nombre pessimiste et
+/// signalé qu'un nombre inventé.
+async fn probe_gpu(devices: &[RpcDevice]) -> (Option<String>, f32) {
+    let mut cmd = tokio::process::Command::new("nvidia-smi");
+    cmd.args([
+        "--query-gpu=name,memory.free",
+        "--format=csv,noheader,nounits",
+    ]);
+    cluster::launch::hide_console(&mut cmd);
+    if let Ok(o) = cmd.output().await {
+        if o.status.success() {
+            let texte = String::from_utf8_lossy(&o.stdout);
+            if let Some(ligne) = texte.lines().next() {
+                let mut parts = ligne.split(',');
+                let nom = parts.next().map(|s| s.trim().to_string());
+                let mio: Option<f32> = parts.next().and_then(|s| s.trim().parse().ok());
+                if let (Some(nom), Some(mio)) = (nom, mio) {
+                    return (Some(nom), mio / 1024.0);
+                }
+            }
+        }
+    }
+    if let Some(carte) = devices
+        .iter()
+        .filter(|d| !d.is_cpu())
+        .max_by_key(|d| d.free_mib)
+    {
+        return (
+            Some(carte.description.clone()),
+            carte.free_mib as f32 / 1024.0,
+        );
+    }
+    let total = std::env::var("LOCARYN_VRAM_GB")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok());
+    (None, total.unwrap_or(0.0))
+}
+
+// ============================================================================
+// Catalogue des modèles partagés (coordinateur).
+// ============================================================================
+
+fn not_coordinator() -> AgentResponse {
+    AgentResponse::Error {
+        message: "cette machine ne coordonne pas de cluster : les modèles partagés se gèrent \
+                  sur la machine du serveur Locaryn (cluster_enroll)"
+            .to_string(),
+    }
+}
+
+async fn shared_models_view(state: &Shared) -> AgentResponse {
+    let models_dir = match cluster::require_models_dir() {
+        Ok(d) => d,
+        Err(message) => return AgentResponse::Error { message },
+    };
+    let s = state.lock().await;
+    if !s.prefs.as_ref().is_some_and(|p| p.coordinator) {
+        return not_coordinator();
+    }
+    let mut vues: Vec<SharedModelView> = catalog::scan_library(&models_dir)
+        .into_iter()
+        .map(|m| {
+            let partage = s.catalog.get(&m.file);
+            SharedModelView {
+                hosted_by: hosts_of(&s, &m.file),
+                shared: partage.is_some(),
+                ready_to_copy: partage.is_some_and(|p| p.sha256.is_some()),
+                file: m.file,
+                size_bytes: m.size_bytes,
+            }
+        })
+        .collect();
+    // Un modèle partagé puis retiré de la bibliothèque reste visible : sinon
+    // on ne pourrait plus cesser de le partager.
+    for m in &s.catalog.models {
+        if !vues.iter().any(|v| v.file == m.file) {
+            vues.push(SharedModelView {
+                file: m.file.clone(),
+                size_bytes: m.size_bytes,
+                shared: true,
+                ready_to_copy: false,
+                hosted_by: hosts_of(&s, &m.file),
+            });
+        }
+    }
+    let mut members: Vec<MemberView> = s
+        .peers
+        .values()
+        .map(|p| {
+            let partage = p.sharing.clone().unwrap_or_default();
+            MemberView {
+                name: p.capability.name.clone(),
+                address: p.address.clone(),
+                sharing: partage.enabled,
+                gpu: partage.enabled && partage.gpu,
+                ram: partage.enabled && partage.ram,
+                storage: partage.enabled && partage.storage,
+                lendable_gb: if p.rpc_port.is_some() {
+                    p.capability.lendable_gb()
+                } else {
+                    0.0
+                },
+                last_seen_unix: p.last_seen_unix,
+            }
+        })
+        .collect();
+    members.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    AgentResponse::SharedModels {
+        models: vues,
+        members,
+    }
+}
+
+fn hosts_of(s: &AgentState, file: &str) -> Vec<String> {
+    let mut noms: Vec<String> = s
+        .peers
+        .values()
+        .filter(|p| {
+            p.sharing
+                .as_ref()
+                .is_some_and(|sh| sh.models_ready.iter().any(|f| f == file))
+        })
+        .map(|p| p.capability.name.clone())
+        .collect();
+    // Une même machine peut être connue sous deux adresses — celle de sa
+    // balise et celle de sa connexion entrante : elle ne compte qu'une fois.
+    noms.sort();
+    noms.dedup();
+    noms
+}
+
+async fn share_model(state: &Shared, file: &str, enabled: bool) -> AgentResponse {
+    let models_dir = match cluster::require_models_dir() {
+        Ok(d) => d,
+        Err(message) => return AgentResponse::Error { message },
+    };
+    {
+        let mut s = state.lock().await;
+        if !s.prefs.as_ref().is_some_and(|p| p.coordinator) {
+            return not_coordinator();
+        }
+        if enabled {
+            if !s.catalog.contains(file) {
+                let Some(meta) = catalog::local_path(&models_dir, file)
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .filter(|m| m.is_file())
+                else {
+                    return AgentResponse::Error {
+                        message: format!("« {file} » n'est pas dans la bibliothèque de poids"),
+                    };
+                };
+                s.catalog.models.push(SharedModel {
+                    file: file.to_string(),
+                    size_bytes: meta.len(),
+                    sha256: None,
+                    modified_unix: catalog::modified_unix(&meta),
+                });
+            }
+        } else {
+            s.catalog.models.retain(|m| m.file != file);
+        }
+        if let Err(e) = s.catalog.save(&cluster::state_dir()) {
+            return AgentResponse::Error {
+                message: format!("catalogue impossible à enregistrer : {e}"),
+            };
+        }
+    }
+    rehash_catalog(state).await;
+    shared_models_view(state).await
+}
+
+/// Calcule, en arrière-plan, l'empreinte des modèles partagés qui n'en ont
+/// pas — ou dont le fichier a changé depuis.
+async fn rehash_catalog(state: &Shared) {
+    let Ok(models_dir) = cluster::require_models_dir() else {
+        return;
+    };
+    let a_calculer: Vec<SharedModel> = {
+        let mut s = state.lock().await;
+        if !s.prefs.as_ref().is_some_and(|p| p.coordinator) {
+            return;
+        }
+        let mut modifie = false;
+        for m in s.catalog.models.iter_mut() {
+            let meta =
+                catalog::local_path(&models_dir, &m.file).and_then(|p| std::fs::metadata(p).ok());
+            if let Some(meta) = meta {
+                let mtime = catalog::modified_unix(&meta);
+                if meta.len() != m.size_bytes || mtime != m.modified_unix {
+                    m.size_bytes = meta.len();
+                    m.modified_unix = mtime;
+                    m.sha256 = None;
+                    modifie = true;
+                }
+            }
+        }
+        if modifie {
+            let _ = s.catalog.save(&cluster::state_dir());
+        }
+        let liste: Vec<SharedModel> = s
+            .catalog
+            .models
+            .iter()
+            .filter(|m| m.sha256.is_none() && !s.hashing.contains(&m.file))
+            .cloned()
+            .collect();
+        for m in &liste {
+            s.hashing.insert(m.file.clone());
+        }
+        liste
+    };
+    for modele in a_calculer {
+        let state = state.clone();
+        let dir = models_dir.clone();
+        tokio::spawn(async move {
+            let chemin = catalog::local_path(&dir, &modele.file);
+            let resultat = match chemin {
+                Some(p) => tokio::task::spawn_blocking(move || catalog::sha256_file(&p))
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string())),
+                None => Err("nom refusé".to_string()),
+            };
+            let mut s = state.lock().await;
+            s.hashing.remove(&modele.file);
+            match resultat {
+                Ok(hash) => {
+                    // Toujours partagé, et toujours le même fichier : sinon
+                    // cette empreinte ne décrit plus rien.
+                    if let Some(m) = s.catalog.models.iter_mut().find(|m| {
+                        m.file == modele.file
+                            && m.size_bytes == modele.size_bytes
+                            && m.modified_unix == modele.modified_unix
+                    }) {
+                        m.sha256 = Some(hash);
+                        let _ = s.catalog.save(&cluster::state_dir());
+                    }
+                }
+                Err(e) => eprintln!("[cluster-agent] empreinte de {} : {e}", modele.file),
+            }
+        });
+    }
+}
+
+// ============================================================================
+// Copie des modèles partagés (poste client).
+// ============================================================================
+
+/// Taille, sur ce poste, de chaque fichier du catalogue.
+fn local_sizes(catalog: &Catalog, models_dir: &std::path::Path) -> BTreeMap<String, u64> {
+    catalog
+        .models
+        .iter()
+        .filter_map(|m| {
+            let taille = catalog::local_path(models_dir, &m.file)
+                .and_then(|p| std::fs::metadata(p).ok())
+                .filter(|meta| meta.is_file())?
+                .len();
+            Some((m.file.clone(), taille))
+        })
+        .collect()
+}
+
+async fn run_sync(agent: Agent) {
+    loop {
+        let _ = tokio::time::timeout(Duration::from_secs(20), agent.wake.notified()).await;
+        if let Err(e) = sync_once(&agent).await {
+            agent.state.lock().await.sync_error = Some(e);
+        }
+    }
+}
+
+async fn sync_once(agent: &Agent) -> Result<(), String> {
+    let (prefs, secret) = {
+        let s = agent.state.lock().await;
+        (
+            s.prefs.clone(),
+            s.identity.as_ref().map(|i| i.secret.clone()),
+        )
+    };
+    let Some(prefs) = prefs else {
+        return Ok(());
+    };
+    let (Some(hote), Some(secret)) = (prefs.coordinator_host.clone(), secret) else {
+        // Ni poste client ni membre : s'il reste des copies, elles n'ont plus
+        // de raison d'être.
+        if !prefs.coordinator {
+            remove_synced_copies(None).await;
+        }
+        return Ok(());
+    };
+    let models_dir = cluster::require_models_dir()?;
+    let adresse = control_address(&hote);
+
+    let catalogue = match peer_channel::authenticated_request(
+        &adresse,
+        &secret,
+        &ControlRequest::Catalog,
+    )
+    .await
+    {
+        Ok(ControlResponse::Catalog { models }) => Catalog { models },
+        Ok(ControlResponse::Error { message }) => {
+            agent.state.lock().await.catalog_reachable = false;
+            return Err(message);
+        }
+        Ok(_) => return Err("réponse inattendue du coordinateur".to_string()),
+        Err(e) => {
+            agent.state.lock().await.catalog_reachable = false;
+            return Err(format!("coordinateur injoignable : {e}"));
+        }
+    };
+    {
+        let mut s = agent.state.lock().await;
+        s.catalog = catalogue.clone();
+        s.catalog_reachable = true;
+        s.sync_error = None;
+    }
+
+    let dir = cluster::state_dir();
+    let mut ledger = SyncLedger::load(&dir);
+    let plan = catalog::plan_sync(
+        &catalogue,
+        &local_sizes(&catalogue, &models_dir),
+        &ledger,
+        prefs.hosts_models(),
+        prefs.quota_bytes(),
+    );
+    for file in &plan.remove {
+        remove_copy(&models_dir, file);
+        ledger.files.remove(file);
+    }
+    if !plan.remove.is_empty() {
+        ledger.save(&dir).map_err(|e| e.to_string())?;
+    }
+
+    // Un seul modèle par passage : le suivant partira au passage d'après,
+    // avec un catalogue et des préférences relus entre-temps.
+    let Some(modele) = plan.download.first().cloned() else {
+        return Ok(());
+    };
+    let progres = Arc::new(AtomicU64::new(0));
+    agent.state.lock().await.downloading = Some((modele.file.clone(), progres.clone()));
+    let copie = transfer::fetch_model(&adresse, &secret, &models_dir, &modele, progres);
+    tokio::pin!(copie);
+    let resultat = loop {
+        tokio::select! {
+            r = &mut copie => break Some(r),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                // La personne a décoché le stockage, ou le modèle n'est plus
+                // partagé : on arrête la copie au lieu de finir 15 Go pour
+                // rien. Le fragment est supprimé au passage suivant.
+                let s = agent.state.lock().await;
+                let toujours = s.prefs.as_ref().is_some_and(SharePrefs::hosts_models);
+                if !toujours {
+                    break None;
+                }
+            }
+        }
+    };
+    agent.state.lock().await.downloading = None;
+    match resultat {
+        Some(Ok(_)) => {
+            ledger.files.insert(modele.file.clone());
+            ledger.save(&dir).map_err(|e| e.to_string())?;
+            agent.wake.notify_one();
+            Ok(())
+        }
+        Some(Err(e)) => Err(e),
+        None => {
+            if let Some(p) = catalog::local_path(&models_dir, &modele.file) {
+                let _ = std::fs::remove_file(transfer::part_path(&p));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn remove_copy(models_dir: &std::path::Path, file: &str) {
+    if let Some(p) = catalog::local_path(models_dir, file) {
+        let _ = std::fs::remove_file(transfer::part_path(&p));
+        if let Err(e) = std::fs::remove_file(&p) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("[cluster-agent] copie {file} non supprimée : {e}");
+            }
+        }
+    }
+}
+
+/// Supprime les copies faites par ce poste — toutes, ou celles hors du
+/// catalogue donné.
+async fn remove_synced_copies(keep: Option<&Catalog>) {
+    let Ok(models_dir) = cluster::require_models_dir() else {
+        return;
+    };
+    let dir = cluster::state_dir();
+    let mut ledger = SyncLedger::load(&dir);
+    if ledger.files.is_empty() {
+        return;
+    }
+    let a_retirer: Vec<String> = ledger
+        .files
+        .iter()
+        .filter(|f| keep.is_none_or(|c| !c.contains(f)))
+        .cloned()
+        .collect();
+    for file in &a_retirer {
+        remove_copy(&models_dir, file);
+        ledger.files.remove(file);
+    }
+    let _ = ledger.save(&dir);
+}
+
+async fn sync_view(state: &Shared) -> AgentResponse {
+    let models_dir = cluster::models_dir();
+    let s = state.lock().await;
+    let prefs = s.prefs.clone().unwrap_or_default();
+    let sizes = models_dir
+        .as_deref()
+        .map(|d| local_sizes(&s.catalog, d))
+        .unwrap_or_default();
+    let plan = catalog::plan_sync(
+        &s.catalog,
+        &sizes,
+        &SyncLedger::load(&cluster::state_dir()),
+        prefs.hosts_models(),
+        prefs.quota_bytes(),
+    );
+    let en_cours = s.downloading.clone();
+    let models = plan
+        .states
+        .into_iter()
+        .map(|(file, state)| {
+            let taille = s.catalog.get(&file).map(|m| m.size_bytes).unwrap_or(0);
+            let copie = en_cours
+                .as_ref()
+                .filter(|(f, _)| f == &file)
+                .map(|(_, p)| p.load(Ordering::Relaxed));
+            SyncEntry {
+                size_bytes: taille,
+                copied_bytes: copie.unwrap_or(if state == LocalState::Ready {
+                    taille
+                } else {
+                    0
+                }),
+                downloading: copie.is_some(),
+                state,
+                file,
+            }
+        })
+        .collect();
+    AgentResponse::Sync {
+        coordinator: prefs.coordinator_host.clone(),
+        reachable: s.catalog_reachable,
+        models,
+        used_bytes: plan.used_bytes,
+        quota_bytes: prefs.quota_bytes(),
+        last_error: s.sync_error.clone(),
+    }
+}
+
+// ============================================================================
+// Réseau du cluster : balise, écoute, poignée de main, rafraîchissement.
+// ============================================================================
+
+/// Ce que cette machine annonce aux autres.
+async fn own_announce(state: &Shared) -> CapabilityAnnounce {
+    let capability = local_capability(state).await;
+    let s = state.lock().await;
+    let sharing = s.prefs.as_ref().map(|p| {
+        let models_ready = match cluster::models_dir() {
+            Some(_) if p.coordinator => s
+                .catalog
+                .models
+                .iter()
+                .filter(|m| m.sha256.is_some())
+                .map(|m| m.file.clone())
+                .collect(),
+            Some(dir) => {
+                let tailles = local_sizes(&s.catalog, &dir);
+                s.catalog
+                    .models
+                    .iter()
+                    .filter(|m| tailles.get(&m.file) == Some(&m.size_bytes))
+                    .map(|m| m.file.clone())
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        SharingAnnounce {
+            enabled: p.enabled,
+            gpu: p.gpu,
+            ram: p.ram,
+            storage: p.storage,
+            coordinator: p.coordinator,
+            models_ready,
+        }
+    });
+    CapabilityAnnounce {
+        v: cluster::PROTOCOL_VERSION,
+        capability,
+        rpc_port: s.rpc_port,
+        sharing,
+    }
 }
 
 async fn bench_peer(peer_id: &str, state: &Shared) -> AgentResponse {
@@ -354,8 +1190,8 @@ async fn bench_peer(peer_id: &str, state: &Shared) -> AgentResponse {
     };
     let debut = SystemTime::now();
     let resultat = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        cluster::peer_channel::authenticated_request(&address, &secret, &ControlRequest::Ping),
+        Duration::from_secs(5),
+        peer_channel::authenticated_request(&address, &secret, &ControlRequest::Ping),
     )
     .await;
     let rtt_ms = SystemTime::now()
@@ -380,9 +1216,62 @@ async fn bench_peer(peer_id: &str, state: &Shared) -> AgentResponse {
     }
 }
 
-// ============================================================================
-// Réseau du cluster : balise, écoute, poignée de main.
-// ============================================================================
+/// Relit régulièrement chaque pair : sa VRAM libre et ce qu'il prête
+/// changent, et un pair éteint doit sortir des plans. Un poste client
+/// rejoint aussi son coordinateur s'il ne le connaît pas encore.
+async fn run_peer_refresh(agent: Agent) {
+    let mut intervalle = tokio::time::interval(Duration::from_secs(15));
+    loop {
+        intervalle.tick().await;
+        let (secret, peers, coordinateur) = {
+            let s = agent.state.lock().await;
+            let Some(identity) = &s.identity else {
+                continue;
+            };
+            (
+                identity.secret.clone(),
+                s.peers
+                    .iter()
+                    .map(|(id, p)| (id.clone(), p.address.clone()))
+                    .collect::<Vec<_>>(),
+                s.prefs.as_ref().and_then(|p| p.coordinator_host.clone()),
+            )
+        };
+        if let Some(hote) = coordinateur {
+            let adresse = control_address(&hote);
+            if !peers.iter().any(|(_, a)| a == &adresse) {
+                if let Err(e) = pair_with(&adresse, &agent.state).await {
+                    eprintln!("[cluster-agent] coordinateur {adresse} injoignable : {e}");
+                }
+            }
+        }
+        for (id, adresse) in peers {
+            let debut = SystemTime::now();
+            let reponse = tokio::time::timeout(
+                Duration::from_secs(5),
+                peer_channel::authenticated_request(&adresse, &secret, &ControlRequest::Ping),
+            )
+            .await;
+            let rtt = SystemTime::now()
+                .duration_since(debut)
+                .unwrap_or_default()
+                .as_millis() as u32;
+            let mut s = agent.state.lock().await;
+            if let Ok(Ok(ControlResponse::Capability(annonce))) = reponse {
+                if let Some(p) = s.peers.get_mut(&id) {
+                    p.capability = annonce.capability;
+                    p.rpc_port = annonce.rpc_port;
+                    p.sharing = annonce.sharing;
+                    p.last_seen_unix = unix_now();
+                    p.round_trip_ms = Some(rtt);
+                }
+            }
+            let maintenant = unix_now();
+            s.peers
+                .retain(|_, p| maintenant.saturating_sub(p.last_seen_unix) < OUBLI_PAIR_SECS);
+        }
+    }
+}
 
 async fn run_beacon_sender(ctrl_port: u16, state: Shared) {
     let Ok(socket) = UdpSocket::bind(("0.0.0.0", 0)).await else {
@@ -394,7 +1283,7 @@ async fn run_beacon_sender(ctrl_port: u16, state: Shared) {
         return;
     }
     let cible = format!("255.255.255.255:{}", cluster::DISCOVERY_UDP_PORT);
-    let mut intervalle = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut intervalle = tokio::time::interval(Duration::from_secs(5));
     loop {
         intervalle.tick().await;
         let fp = {
@@ -417,7 +1306,7 @@ async fn run_beacon_sender(ctrl_port: u16, state: Shared) {
     }
 }
 
-async fn run_beacon_listener(state: Shared) {
+async fn run_beacon_listener(agent: Agent) {
     let Ok(socket) = UdpSocket::bind(("0.0.0.0", cluster::DISCOVERY_UDP_PORT)).await else {
         eprintln!(
             "[cluster-agent] port de découverte {} indisponible — une autre instance tourne \
@@ -435,7 +1324,7 @@ async fn run_beacon_listener(state: Shared) {
             continue;
         };
         let fp_attendue = {
-            let s = state.lock().await;
+            let s = agent.state.lock().await;
             s.identity
                 .as_ref()
                 .map(|i| cluster::beacon_fingerprint(&i.cluster_id, &i.secret))
@@ -448,13 +1337,13 @@ async fn run_beacon_listener(state: Shared) {
         // connu : ne relancer une poignée de main que si ce pair est
         // nouveau, pour ne pas saturer le canal de contrôle.
         let deja_connu = {
-            let s = state.lock().await;
+            let s = agent.state.lock().await;
             s.peers.values().any(|p| p.address == adresse_controle)
         };
         if deja_connu {
             continue;
         }
-        let state = state.clone();
+        let state = agent.state.clone();
         tokio::spawn(async move {
             if let Err(e) = pair_with(&adresse_controle, &state).await {
                 eprintln!("[cluster-agent] pairage avec {adresse_controle} échoué : {e}");
@@ -463,8 +1352,8 @@ async fn run_beacon_listener(state: Shared) {
     }
 }
 
-/// Initie une poignée de main vers un pair repéré par balise, ou ajouté
-/// manuellement.
+/// Initie une poignée de main vers un pair repéré par balise, ou vers le
+/// coordinateur d'un poste inscrit.
 async fn pair_with(address: &str, state: &Shared) -> Result<(), String> {
     let secret = {
         let s = state.lock().await;
@@ -473,50 +1362,35 @@ async fn pair_with(address: &str, state: &Shared) -> Result<(), String> {
             .map(|i| i.secret.clone())
             .ok_or("aucun cluster actif")?
     };
-    let mut stream = TcpStream::connect(address)
-        .await
-        .map_err(|e| format!("connexion impossible : {e}"))?;
-
-    let (initiateur, hello) = InitiatorHandshake::start(&secret);
-    write_json_line(&mut stream, &hello).await?;
-    let ack: locaryn_plugin_cluster::hmac_auth::HelloAck = read_json_line(&mut stream).await?;
-    let confirm = initiateur.receive_ack(&ack)?;
-    write_json_line(&mut stream, &confirm).await?;
+    let mut stream = peer_channel::authenticated_stream(address, &secret).await?;
 
     // Authentifié des deux côtés : on échange les capacités.
-    let self_cap = local_capability(state.lock().await.rpc_port.is_some()).await;
-    let rpc_port = state.lock().await.rpc_port;
-    let announce = CapabilityAnnounce {
-        v: cluster::PROTOCOL_VERSION,
-        capability: self_cap,
-        rpc_port,
-    };
-    write_json_line(&mut stream, &announce).await?;
+    let annonce = own_announce(state).await;
+    write_json_line(&mut stream, &annonce).await?;
     let leur_annonce: CapabilityAnnounce = read_json_line(&mut stream).await?;
 
-    let peer_id = peer_id_for(address);
     let peer = Peer {
-        id: peer_id.clone(),
+        id: address.to_string(),
         address: address.to_string(),
         rpc_port: leur_annonce.rpc_port,
         capability: leur_annonce.capability,
         last_seen_unix: unix_now(),
         round_trip_ms: None,
+        sharing: leur_annonce.sharing,
     };
-    let mut s = state.lock().await;
-    s.peers.insert(peer_id, peer);
+    state.lock().await.peers.insert(peer.id.clone(), peer);
     Ok(())
 }
 
 /// Écoute entrante : un pair qui a reconnu notre balise se présente ici.
-async fn run_peer_listener(listener: TcpListener, state: Shared) {
+async fn run_peer_listener(listener: TcpListener, agent: Agent) {
     loop {
         let Ok((socket, from)) = listener.accept().await else {
             continue;
         };
-        let state = state.clone();
+        let agent = agent.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_incoming_peer(socket, from.ip().to_string(), &state).await {
+            if let Err(e) = handle_incoming_peer(socket, from.ip().to_string(), &agent).await {
                 eprintln!("[cluster-agent] pair entrant refusé : {e}");
             }
         });
@@ -526,8 +1400,9 @@ async fn run_peer_listener(listener: TcpListener, state: Shared) {
 async fn handle_incoming_peer(
     mut stream: TcpStream,
     from_ip: String,
-    state: &Shared,
+    agent: &Agent,
 ) -> Result<(), String> {
+    let state = &agent.state;
     let secret = {
         let s = state.lock().await;
         s.identity
@@ -542,65 +1417,103 @@ async fn handle_incoming_peer(
     repondant.receive_confirm(&confirm)?;
 
     // Authentifié : soit c'est l'échange initial de capacités (poignée de
-    // main de découverte), soit une requête de contrôle sur une connexion
-    // déjà établie. On distingue par la forme du prochain message.
-    let raw = read_line(&mut stream).await?;
-    if let Ok(leur_annonce) = serde_json::from_str::<CapabilityAnnounce>(&raw) {
-        let self_cap = local_capability(state.lock().await.rpc_port.is_some()).await;
-        let rpc_port = state.lock().await.rpc_port;
-        let announce = CapabilityAnnounce {
-            v: cluster::PROTOCOL_VERSION,
-            capability: self_cap,
-            rpc_port,
-        };
-        write_json_line(&mut stream, &announce).await?;
-
-        let peer_id = peer_id_for(&from_ip);
-        let peer = Peer {
-            id: peer_id.clone(),
-            address: format!("{from_ip}:{}", cluster::DEFAULT_CONTROL_PORT),
-            rpc_port: leur_annonce.rpc_port,
-            capability: leur_annonce.capability,
-            last_seen_unix: unix_now(),
-            round_trip_ms: None,
-        };
-        let mut s = state.lock().await;
-        s.peers.insert(peer_id, peer);
-        return Ok(());
+    // main de découverte), soit une requête de contrôle. On distingue par la
+    // forme du prochain message.
+    let raw: serde_json::Value = read_json_line(&mut stream).await?;
+    if let Ok(requete) = serde_json::from_value::<ControlRequest>(raw.clone()) {
+        return answer_control(requete, &mut stream, agent).await;
     }
+    let leur_annonce: CapabilityAnnounce = serde_json::from_value(raw)
+        .map_err(|_| "message inattendu après authentification".to_string())?;
+    let annonce = own_announce(state).await;
+    write_json_line(&mut stream, &annonce).await?;
 
-    if let Ok(req) = serde_json::from_str::<ControlRequest>(&raw) {
-        let reponse = match req {
-            ControlRequest::Ping => {
-                let cap = local_capability(state.lock().await.rpc_port.is_some()).await;
-                let rpc_port = state.lock().await.rpc_port;
-                ControlResponse::Capability(CapabilityAnnounce {
-                    v: cluster::PROTOCOL_VERSION,
-                    capability: cap,
-                    rpc_port,
-                })
-            }
-            ControlRequest::StartRpc => match start_worker(state).await {
-                AgentResponse::WorkerStarted { port } => ControlResponse::RpcStarted { port },
-                AgentResponse::Error { message } => ControlResponse::Error { message },
-                _ => ControlResponse::Error {
-                    message: "réponse inattendue".into(),
-                },
-            },
-            ControlRequest::StopRpc => {
-                stop_worker(state).await;
-                ControlResponse::RpcStopped
-            }
-        };
-        write_json_line(&mut stream, &reponse).await?;
-        return Ok(());
-    }
-
-    Err("message inattendu après authentification".to_string())
+    let address = format!("{from_ip}:{}", cluster::DEFAULT_CONTROL_PORT);
+    let peer = Peer {
+        id: address.clone(),
+        address,
+        rpc_port: leur_annonce.rpc_port,
+        capability: leur_annonce.capability,
+        last_seen_unix: unix_now(),
+        round_trip_ms: None,
+        sharing: leur_annonce.sharing,
+    };
+    state.lock().await.peers.insert(peer.id.clone(), peer);
+    Ok(())
 }
 
-fn peer_id_for(address: &str) -> String {
-    address.to_string()
+async fn answer_control(
+    requete: ControlRequest,
+    stream: &mut TcpStream,
+    agent: &Agent,
+) -> Result<(), String> {
+    let state = &agent.state;
+    let reponse = match requete {
+        ControlRequest::Ping => ControlResponse::Capability(own_announce(state).await),
+        ControlRequest::StartRpc => {
+            let permis = SharePrefs::allows_remote_start(state.lock().await.prefs.as_ref());
+            if !permis {
+                ControlResponse::Error {
+                    message: format!(
+                        "{} n'a pas accepté de prêter ses ressources (réglages du compte)",
+                        hostname()
+                    ),
+                }
+            } else {
+                match start_worker(state).await {
+                    AgentResponse::WorkerStarted { port } => ControlResponse::RpcStarted { port },
+                    AgentResponse::Error { message } => ControlResponse::Error { message },
+                    _ => ControlResponse::Error {
+                        message: "réponse inattendue".into(),
+                    },
+                }
+            }
+        }
+        ControlRequest::StopRpc => {
+            // Une machine qui prête par choix garde son serveur : c'est la
+            // personne qui l'arrête, depuis ses réglages.
+            let garde = state
+                .lock()
+                .await
+                .prefs
+                .as_ref()
+                .is_some_and(SharePrefs::lends_compute);
+            if !garde {
+                stop_worker(state).await;
+            }
+            ControlResponse::RpcStopped
+        }
+        ControlRequest::Catalog => {
+            let s = state.lock().await;
+            if s.prefs.as_ref().is_some_and(|p| p.coordinator) {
+                ControlResponse::Catalog {
+                    models: s.catalog.models.clone(),
+                }
+            } else {
+                ControlResponse::Error {
+                    message: "cette machine ne coordonne pas de cluster".to_string(),
+                }
+            }
+        }
+        ControlRequest::FetchModel { file, offset } => {
+            let (coordinateur, catalogue) = {
+                let s = state.lock().await;
+                (
+                    s.prefs.as_ref().is_some_and(|p| p.coordinator),
+                    s.catalog.clone(),
+                )
+            };
+            if !coordinateur {
+                ControlResponse::Error {
+                    message: "cette machine ne coordonne pas de cluster".to_string(),
+                }
+            } else {
+                let models_dir = cluster::require_models_dir()?;
+                return transfer::serve_model(stream, &catalogue, &models_dir, &file, offset).await;
+            }
+        }
+    };
+    write_json_line(stream, &reponse).await
 }
 
 fn unix_now() -> u64 {
@@ -608,61 +1521,4 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-async fn write_json_line<T: serde::Serialize>(
-    stream: &mut TcpStream,
-    value: &T,
-) -> Result<(), String> {
-    let mut bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
-    bytes.push(b'\n');
-    stream.write_all(&bytes).await.map_err(|e| e.to_string())
-}
-
-async fn read_line(stream: &mut TcpStream) -> Result<String, String> {
-    let mut reader = BufReader::new(stream);
-    let mut buf = String::new();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        reader.read_line(&mut buf),
-    )
-    .await
-    .map_err(|_| "délai dépassé en attendant le pair".to_string())?
-    .map_err(|e| e.to_string())?;
-    if buf.trim().is_empty() {
-        return Err("connexion fermée par le pair".to_string());
-    }
-    Ok(buf)
-}
-
-async fn read_json_line<T: serde::de::DeserializeOwned>(
-    stream: &mut TcpStream,
-) -> Result<T, String> {
-    // `read_line` consomme le flux dans un `BufReader` neuf à chaque appel :
-    // sur une même connexion on perdrait ce qui a été lu en trop. La poignée
-    // de main n'envoie qu'une ligne à la fois de chaque côté, donc ce n'est
-    // pas encore un problème ici — un futur multiplexage sur la même
-    // connexion devra porter le `BufReader` d'un appel à l'autre.
-    let raw = read_line_direct(stream).await?;
-    serde_json::from_str(raw.trim()).map_err(|e| format!("message illisible : {e}"))
-}
-
-async fn read_line_direct(stream: &mut TcpStream) -> Result<String, String> {
-    use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut byte))
-            .await
-            .map_err(|_| "délai dépassé en attendant le pair".to_string())?
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err("connexion fermée par le pair".to_string());
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        buf.push(byte[0]);
-    }
-    String::from_utf8(buf).map_err(|e| e.to_string())
 }

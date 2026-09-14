@@ -40,8 +40,18 @@ pub async fn ensure_running() -> Result<u16, String> {
             });
         }
     }
-    cmd.spawn()
-        .map_err(|e| format!("{} : {e}", bin.display()))?;
+    // Sous Windows, un processus lancé hérite de toutes les poignées
+    // héritables de son parent — dont les tubes de sortie que l'hôte a
+    // branchés sur ce serveur MCP ou sur le lanceur. L'agent vit plus
+    // longtemps qu'eux : il garderait ces tubes ouverts, et celui qui lit
+    // attendrait une fin qui ne vient jamais. On retire l'héritage le temps
+    // du lancement, puis on le rétablit : le lanceur en a besoin pour que
+    // `llama-server` écrive son journal chez l'hôte.
+    let lancement = {
+        let _garde = flux_non_heritables();
+        cmd.spawn()
+    };
+    lancement.map_err(|e| format!("{} : {e}", bin.display()))?;
 
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -50,6 +60,61 @@ pub async fn ensure_running() -> Result<u16, String> {
         }
     }
     Err("l'agent Cluster n'a pas démarré à temps (5 s)".to_string())
+}
+
+/// Rend les flux standards non héritables jusqu'à la fin de la garde.
+#[cfg(windows)]
+fn flux_non_heritables() -> impl Drop {
+    use std::ffi::c_void;
+    extern "system" {
+        fn GetStdHandle(n: u32) -> *mut c_void;
+        fn GetHandleInformation(h: *mut c_void, flags: *mut u32) -> i32;
+        fn SetHandleInformation(h: *mut c_void, mask: u32, flags: u32) -> i32;
+    }
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE : -10, -11, -12.
+    const FLUX: [u32; 3] = [(-10i32) as u32, (-11i32) as u32, (-12i32) as u32];
+
+    struct Garde(Vec<(*mut c_void, u32)>);
+    impl Drop for Garde {
+        fn drop(&mut self) {
+            for (h, flags) in &self.0 {
+                // SAFETY : poignées lues juste avant sur ce même processus.
+                unsafe {
+                    SetHandleInformation(*h, HANDLE_FLAG_INHERIT, flags & HANDLE_FLAG_INHERIT);
+                }
+            }
+        }
+    }
+
+    let mut retirees = Vec::new();
+    for n in FLUX {
+        // SAFETY : appels Win32 sans effet hors des indicateurs de poignée ;
+        // une poignée nulle ou invalide est simplement ignorée.
+        unsafe {
+            let h = GetStdHandle(n);
+            if h.is_null() || h as isize == -1 {
+                continue;
+            }
+            let mut flags = 0u32;
+            if GetHandleInformation(h, &mut flags) != 0 && flags & HANDLE_FLAG_INHERIT != 0 {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+                retirees.push((h, flags));
+            }
+        }
+    }
+    Garde(retirees)
+}
+
+/// Sous Unix, `Stdio::null` remplace les trois flux dans l'enfant : rien à
+/// retirer.
+#[cfg(not(windows))]
+fn flux_non_heritables() -> impl Drop {
+    struct Garde;
+    impl Drop for Garde {
+        fn drop(&mut self) {}
+    }
+    Garde
 }
 
 #[cfg(unix)]

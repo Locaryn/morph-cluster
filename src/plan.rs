@@ -78,8 +78,8 @@ pub fn compute(
     let mut candidats: Vec<&Peer> = peers.iter().collect();
     candidats.sort_by(|a, b| {
         b.capability
-            .free_vram_gb
-            .partial_cmp(&a.capability.free_vram_gb)
+            .lendable_gb()
+            .partial_cmp(&a.capability.lendable_gb())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
@@ -111,7 +111,7 @@ pub fn compute(
                 continue;
             }
         }
-        let usable = (peer.capability.free_vram_gb * (1.0 - MARGE_SECURITE)).max(0.0);
+        let usable = (peer.capability.lendable_gb() * (1.0 - MARGE_SECURITE)).max(0.0);
         members.push(PlanMember {
             peer_id: peer.id.clone(),
             address: peer.address.clone(),
@@ -192,9 +192,11 @@ mod tests {
                 free_vram_gb: vram,
                 has_llama_server: true,
                 has_rpc_server,
+                offered_memory_gb: 0.0,
             },
             last_seen_unix: 0,
             round_trip_ms: rtt,
+            sharing: None,
         }
     }
 

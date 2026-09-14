@@ -19,7 +19,30 @@ appartiennent à Réglages → Moteur, comme pour tout moteur d'extension. Ces
 outils servent à préparer et surveiller le cluster **avant** de choisir ce
 moteur — pas à le piloter à sa place.
 
-## Ordre à suivre pour mettre en place un cluster
+## Avec un serveur Locaryn : c'est le panneau de compte qui fait tout
+
+Quand des postes sont connectés à un serveur Locaryn, le partage se règle dans
+**Réglages → Compte → Partage de ressources**, sur chaque machine :
+
+- sur un **poste client**, la case « Allouer cette machine au partage de
+  ressources » l'inscrit auprès du serveur par le compte de la personne (sans
+  code à recopier), puis choisit ce qu'il prête : carte graphique, mémoire vive,
+  stockage et son quota ;
+- sur le **serveur** ou depuis un poste, un interrupteur par modèle le partage :
+  les postes qui hébergent des modèles en font une copie vérifiée ; couper le
+  partage retire ces copies.
+
+Orientez vers ce panneau plutôt que d'enchaîner les outils. Ceux qui touchent
+aux choix de la personne — `cluster_share_set`, `cluster_share_model`,
+`cluster_leave` — ne s'appellent que sur sa demande explicite. Pour répondre à
+« qu'est-ce qui est partagé ? » : `cluster_shared_models` sur le serveur,
+`cluster_sync_status` sur un poste client (état de chaque copie ici).
+
+Ne présentez jamais un poste comme prêtant ses ressources parce qu'il est membre
+du cluster : tant que sa case n'est pas cochée, il refuse qu'on démarre son
+serveur RPC.
+
+## Ordre à suivre pour mettre en place un cluster sans serveur
 
 1. Sur la première machine : `cluster_status` pour vérifier qu'un GPU et
    llama.cpp sont détectés, puis `cluster_create` avec un nom. L'outil renvoie

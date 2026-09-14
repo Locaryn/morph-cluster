@@ -31,12 +31,15 @@ use std::path::PathBuf;
 
 pub mod agent_client;
 pub mod agent_protocol;
+pub mod catalog;
 pub mod discovery;
 pub mod hmac_auth;
 pub mod identity;
 pub mod launch;
 pub mod peer_channel;
 pub mod plan;
+pub mod sharing;
+pub mod transfer;
 
 /// Version du protocole de découverte et de pairage. Change si le format des
 /// messages change — une machine qui ne la reconnaît pas ignore le message
@@ -96,14 +99,40 @@ pub struct Capability {
     pub has_llama_server: bool,
     /// `ggml-rpc-server` est présent et joignable.
     pub has_rpc_server: bool,
+    /// La mémoire que son serveur RPC offre réellement, en gibioctets : la
+    /// VRAM libre des cartes prêtées, plus la mémoire vive si elle l'est
+    /// aussi. Zéro chez une machine qui n'a pas enregistré de préférences de
+    /// partage — la VRAM libre fait alors foi, comme avant.
+    #[serde(default)]
+    pub offered_memory_gb: f32,
 }
 
 impl Capability {
+    /// Ce que le calcul de répartition peut confier à cette machine, avant
+    /// marge de sécurité.
+    pub fn lendable_gb(&self) -> f32 {
+        if self.offered_memory_gb > 0.0 {
+            self.offered_memory_gb
+        } else {
+            self.free_vram_gb
+        }
+    }
+
     /// Cette machine peut-elle jouer le rôle de travailleur (prêter son
     /// GPU) ? Sans `ggml-rpc-server`, elle ne peut qu'observer le cluster.
     pub fn can_serve(&self) -> bool {
-        self.has_rpc_server && self.free_vram_gb > 0.1
+        self.has_rpc_server && self.lendable_gb() > 0.1
     }
+}
+
+/// Le dossier de la bibliothèque de poids, ou une erreur qui dit pourquoi il
+/// manque — c'est l'hôte qui le donne, et un agent lancé à la main ne l'a pas.
+pub fn require_models_dir() -> Result<PathBuf, String> {
+    models_dir().ok_or_else(|| {
+        "bibliothèque de poids inconnue : LOCARYN_MODELS_DIR n'est pas défini (l'agent doit \
+         être lancé par Locaryn)"
+            .to_string()
+    })
 }
 
 /// Un pair tel que l'agent le connaît : sa capacité déclarée, où le joindre,
@@ -126,6 +155,9 @@ pub struct Peer {
     /// (Wi-Fi faible, tunnel à forte latence) peut ralentir plus qu'il
     /// n'aide.
     pub round_trip_ms: Option<u32>,
+    /// Ce que ce pair prête et héberge, tel qu'il l'a annoncé.
+    #[serde(default)]
+    pub sharing: Option<sharing::SharingAnnounce>,
 }
 
 /// Empreinte courte d'un identifiant de cluster, montrée dans la balise de
@@ -185,7 +217,26 @@ mod tests {
             free_vram_gb: 6.0,
             has_llama_server: true,
             has_rpc_server: false,
+            offered_memory_gb: 0.0,
         };
         assert!(!cap.can_serve());
+    }
+
+    /// La mémoire vive prêtée compte : une machine sans carte mais qui prête
+    /// 12 Go de RAM porte 12 Go de couches.
+    #[test]
+    fn la_memoire_offerte_prime_sur_la_vram_libre() {
+        let cap = Capability {
+            name: "essai".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            gpu_name: None,
+            free_vram_gb: 0.0,
+            has_llama_server: true,
+            has_rpc_server: true,
+            offered_memory_gb: 12.0,
+        };
+        assert!(cap.can_serve());
+        assert_eq!(cap.lendable_gb(), 12.0);
     }
 }

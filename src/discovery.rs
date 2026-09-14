@@ -10,6 +10,8 @@
 //! `locaryn-cluster-agent`) tient les sockets. Séparer les deux, c'est ce qui
 //! rend le format testable sans réseau.
 
+use crate::catalog::SharedModel;
+use crate::sharing::SharingAnnounce;
 use crate::Capability;
 use serde::{Deserialize, Serialize};
 
@@ -50,10 +52,13 @@ pub struct CapabilityAnnounce {
     pub capability: Capability,
     /// Port où `ggml-rpc-server` répond, si cette machine l'a démarré.
     pub rpc_port: Option<u16>,
+    /// Ce que cette machine prête, et les modèles partagés qu'elle héberge.
+    /// Absent chez une machine d'avant le partage : elle reste un pair valable.
+    #[serde(default)]
+    pub sharing: Option<SharingAnnounce>,
 }
 
 /// Une requête sur le canal de contrôle, une fois la poignée de main faite.
-/// Compacte : ce protocole n'a que trois besoins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlRequest {
@@ -66,15 +71,36 @@ pub enum ControlRequest {
     /// « Arrête-le » — après une session, pour ne pas laisser un port RPC
     /// ouvert plus longtemps que nécessaire.
     StopRpc,
+    /// « Quels modèles partages-tu ? » — envoyé au coordinateur par un poste
+    /// client.
+    Catalog,
+    /// « Envoie-moi ce modèle à partir de cet octet » — la réponse
+    /// [`ControlResponse::ModelStream`] est suivie des octets bruts, sur la
+    /// même connexion. Reprendre à `offset` évite de recopier 15 Go après une
+    /// coupure à 14.
+    FetchModel { file: String, offset: u64 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlResponse {
     Capability(CapabilityAnnounce),
-    RpcStarted { port: u16 },
+    RpcStarted {
+        port: u16,
+    },
     RpcStopped,
-    Error { message: String },
+    Catalog {
+        models: Vec<SharedModel>,
+    },
+    /// En-tête d'un envoi : `size_bytes - offset` octets suivent.
+    ModelStream {
+        file: String,
+        size_bytes: u64,
+        offset: u64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -90,6 +116,7 @@ mod tests {
             free_vram_gb: 6.0,
             has_llama_server: true,
             has_rpc_server: true,
+            offered_memory_gb: 0.0,
         }
     }
 
@@ -120,11 +147,35 @@ mod tests {
             v: 1,
             capability: capacite(),
             rpc_port: Some(50052),
+            sharing: None,
         };
         let bytes = serde_json::to_vec(&a).unwrap();
         let relu: CapabilityAnnounce = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(relu.rpc_port, Some(50052));
         assert_eq!(relu.capability.free_vram_gb, 6.0);
+    }
+
+    /// Une machine en version 0.1 n'annonce ni partage ni mémoire offerte :
+    /// elle doit rester lisible, pas être rejetée du cluster.
+    #[test]
+    fn l_annonce_d_une_machine_d_avant_le_partage_se_lit_encore() {
+        let ancienne = r#"{"v":1,"capability":{"name":"a","os":"linux","arch":"x86_64","gpu_name":null,"free_vram_gb":8.0,"has_llama_server":true,"has_rpc_server":true},"rpc_port":null}"#;
+        let relu: CapabilityAnnounce = serde_json::from_str(ancienne).unwrap();
+        assert!(relu.sharing.is_none());
+        assert_eq!(relu.capability.offered_memory_gb, 0.0);
+    }
+
+    #[test]
+    fn une_demande_de_modele_porte_son_point_de_reprise() {
+        let json = serde_json::to_string(&ControlRequest::FetchModel {
+            file: "a.gguf".into(),
+            offset: 42,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"fetch_model","file":"a.gguf","offset":42}"#
+        );
     }
 
     #[test]

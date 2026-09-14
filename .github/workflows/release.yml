@@ -81,8 +81,8 @@ jobs:
           --bin locaryn-cluster-agent --bin locaryn-cluster-mcp --bin locaryn-cluster-launch
 
       # Le paquet ne contient que ce qui tourne chez l'utilisateur : le
-      # manifeste, la compétence, la configuration MCP et les trois
-      # exécutables. Les sources restent sur le dépôt.
+      # manifeste, la compétence, la configuration MCP, le panneau et les
+      # trois exécutables. Les sources restent sur le dépôt.
       - name: Assembler le paquet
         shell: bash
         run: |
@@ -90,13 +90,19 @@ jobs:
           rm -rf bundle
           mkdir -p bundle/bin
           cp morph.json SKILL.md README.md LICENSE bundle/
-          cp -r mcp bundle/
+          cp -r mcp dist bundle/
           for exe in locaryn-cluster-agent locaryn-cluster-mcp locaryn-cluster-launch; do
             cp "target/${{ matrix.target }}/release/${exe}${{ matrix.ext }}" bundle/bin/
             test -f "bundle/bin/${exe}${{ matrix.ext }}"
           done
           test -f bundle/morph.json
           test -f bundle/mcp/mcp.json
+          # Chaque fichier que le manifeste nomme comme entrée d'interface doit
+          # être dans le paquet : sans lui, le morph s'installe et son panneau
+          # reste un cadre vide.
+          for entree in $(sed -n 's/.*"entry"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' morph.json); do
+            test -f "bundle/${entree}" || { echo "::error::${entree} absent du paquet"; exit 1; }
+          done
 
       # Les artefacts ne conservent pas le bit exécutable ; le job de release
       # le repose avant d'archiver, sinon les programmes livrés ne démarrent

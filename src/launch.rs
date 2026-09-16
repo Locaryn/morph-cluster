@@ -53,36 +53,36 @@ fn which(exe: &str) -> Option<PathBuf> {
 
 /// L'archive à récupérer pour cette machine, si l'application en connaît une.
 ///
-/// Même version que le runtime géré par l'hôte (`b10088`), pour que les deux
+/// Même version que le runtime géré par l'hôte (`b11003`), pour que les deux
 /// composants restent compatibles s'ils venaient à coexister. La variante
 /// choisie est Vulkan — elle calcule sur GPU NVIDIA, AMD et Intel sans
 /// exiger un jeu d'outils propre à un fabricant ; une machine avec son propre
 /// llama.cpp compilé pour CUDA ou ROCm est trouvée avant d'en arriver là
 /// (voir [`find_binary`]).
 ///
-/// L'installateur natif de l'application demande, pour Linux, une archive
-/// `.zip` qui n'existe plus sous ce nom — seule une `.tar.gz` est publiée.
-/// Cette fonction utilise la bonne extension par plateforme ; ce n'est pas
-/// qu'une prudence : l'installation native est aujourd'hui cassée sur Linux
-/// pour cette raison précise.
+/// L'installateur natif de l'application demandait, pour Linux, une archive
+/// `.zip` qui n'existe plus sous ce nom — seule une `.tar.gz` est publiée ;
+/// corrigé côté hôte le 16/09/2026 (`services/provider-supervisor`). Cette
+/// fonction utilise la bonne extension par plateforme depuis le début, ce
+/// qui l'avait rendue indépendante du bogue.
 pub fn release_url() -> Option<&'static str> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     match (os, arch) {
         ("windows", _) => Some(
-            "https://github.com/ggml-org/llama.cpp/releases/download/b10088/llama-b10088-bin-win-vulkan-x64.zip",
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11003/llama-b11003-bin-win-vulkan-x64.zip",
         ),
         ("linux", "x86_64") => Some(
-            "https://github.com/ggml-org/llama.cpp/releases/download/b10088/llama-b10088-bin-ubuntu-vulkan-x64.tar.gz",
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11003/llama-b11003-bin-ubuntu-vulkan-x64.tar.gz",
         ),
         ("linux", "aarch64") => Some(
-            "https://github.com/ggml-org/llama.cpp/releases/download/b10088/llama-b10088-bin-ubuntu-vulkan-arm64.tar.gz",
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11003/llama-b11003-bin-ubuntu-vulkan-arm64.tar.gz",
         ),
         ("macos", "aarch64") => Some(
-            "https://github.com/ggml-org/llama.cpp/releases/download/b10088/llama-b10088-bin-macos-arm64.tar.gz",
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11003/llama-b11003-bin-macos-arm64.tar.gz",
         ),
         ("macos", "x86_64") => Some(
-            "https://github.com/ggml-org/llama.cpp/releases/download/b10088/llama-b10088-bin-macos-x64.tar.gz",
+            "https://github.com/ggml-org/llama.cpp/releases/download/b11003/llama-b11003-bin-macos-x64.tar.gz",
         ),
         _ => None,
     }
@@ -191,7 +191,7 @@ async fn extraire_tar_gz(archive: &Path, dest: &Path) -> Result<(), String> {
     if !statut.success() {
         return Err(format!("« tar » a échoué ({statut})"));
     }
-    // `tar` conserve les sous-dossiers de l'archive (`llama-b10088/…`) ; on
+    // `tar` conserve les sous-dossiers de l'archive (`llama-b11003/…`) ; on
     // met à plat comme pour `.zip`, pour que `find_binary` n'ait qu'un seul
     // niveau à chercher.
     aplatir(dest)

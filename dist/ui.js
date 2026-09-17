@@ -124,6 +124,14 @@
       TAG + " .cs-actions{display:flex;gap:var(--space-2,8px);flex-wrap:wrap;margin-top:var(--space-3,12px)}",
       TAG + " .cs-actions button{min-height:40px}",
       TAG + " .cs-empty{padding:var(--space-4,16px) 0;color:var(--text-faint);font-size:var(--text-sm,13px)}",
+      TAG + " .cs-dash-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:var(--space-3,12px);margin-bottom:var(--space-4,16px)}",
+      TAG + " .cs-dash-tile{padding:var(--space-3,12px);border:1px solid var(--border);border-radius:var(--radius,10px);background:var(--surface)}",
+      TAG + " .cs-dash-value{font-size:var(--text-lg,18px);font-weight:700;color:var(--text)}",
+      TAG + " .cs-dash-label{font-size:var(--text-xs,12px);color:var(--text-dim);margin-top:2px}",
+      TAG + " .cs-member{border-top:1px solid var(--border);padding:var(--space-3,12px) 0}",
+      TAG + " .cs-member:first-child{border-top:0}",
+      TAG + " .cs-member-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:var(--space-3,12px);margin-top:var(--space-2,8px)}",
+      TAG + " .cs-meter-label{font-size:var(--text-xs,12px);color:var(--text-dim);margin-bottom:3px;white-space:nowrap}",
     ].join("\n");
     document.head.appendChild(s);
   }
@@ -345,7 +353,11 @@
       }
       if (this.isClient()) this.appendChild(this.renderMachine());
       this.appendChild(this.renderModels());
-      if (this.isServer()) this.appendChild(this.renderMembers());
+      // Le tableau de bord vient du coordinateur (`shared_models_view`), qui
+      // répond aussi bien à un appel local qu'à un appel relayé depuis un
+      // poste client (`server.invokeTool`) — pas de raison de le réserver
+      // au serveur.
+      this.appendChild(this.renderMembers());
     }
 
     renderLocal() {
@@ -673,35 +685,142 @@
       return r;
     }
 
+    /** Barre d'occupation étiquetée : "3.2 / 8.0 Go" ou "42 %" sans total. */
+    meter(usedLabel, pct) {
+      var wrap = el("div");
+      var bar = el("div", "cs-bar");
+      var fill = el("span");
+      fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
+      bar.appendChild(fill);
+      wrap.appendChild(el("div", "cs-meter-label", usedLabel));
+      wrap.appendChild(bar);
+      return wrap;
+    }
+
+    /** Somme des capacités annoncées par chaque machine — le cluster comme
+     *  s'il était une seule machine. Une machine qui n'a encore rien annoncé
+     *  (total_ram_gb à zéro) est comptée dans le nombre de postes, pas dans
+     *  les moyennes : un zéro non mesuré tirerait la moyenne CPU vers le bas
+     *  sans rien dire de vrai. */
+    aggregate() {
+      var members = this.members || [];
+      var withCpu = members.filter(function (m) {
+        return m.total_ram_gb > 0;
+      });
+      var sum = function (key) {
+        return members.reduce(function (acc, m) {
+          return acc + (m[key] || 0);
+        }, 0);
+      };
+      var totalVram = sum("total_vram_gb");
+      var freeVram = sum("free_vram_gb");
+      var totalRam = sum("total_ram_gb");
+      var freeRam = sum("free_ram_gb");
+      var avgCpu = withCpu.length
+        ? withCpu.reduce(function (acc, m) {
+            return acc + m.cpu_usage_percent;
+          }, 0) / withCpu.length
+        : 0;
+      return {
+        machines: members.length,
+        totalVram: totalVram,
+        usedVram: Math.max(0, totalVram - freeVram),
+        totalRam: totalRam,
+        usedRam: Math.max(0, totalRam - freeRam),
+        avgCpu: avgCpu,
+      };
+    }
+
     renderMembers() {
       var section = el("section", "cs-section");
       section.appendChild(el("div", "cs-title", "Machines du cluster"));
       section.appendChild(
-        el("p", "cs-sub", "Les postes connectés à ce serveur qui ont rejoint le cluster, et ce qu'ils prêtent."),
+        el("p", "cs-sub", "Les postes connectés à ce serveur qui ont rejoint le cluster, ce qu'ils prêtent, et leur charge en direct."),
       );
-      var list = el("div", "cs-list");
+
       if (!this.members.length) {
-        list.appendChild(
+        var vide = el("div", "cs-list");
+        vide.appendChild(
           el(
             "div",
             "cs-empty",
             "Aucun poste pour l'instant. Sur un poste connecté à ce serveur : Réglages → Compte → Partage de ressources.",
           ),
         );
+        section.appendChild(vide);
+        return section;
       }
+
+      var agg = this.aggregate();
+      var dash = el("div", "cs-dash-grid");
+      var tile = function (label, value) {
+        var t = el("div", "cs-dash-tile");
+        t.appendChild(el("div", "cs-dash-value", value));
+        t.appendChild(el("div", "cs-dash-label", label));
+        return t;
+      };
+      dash.appendChild(tile("Machines", String(agg.machines)));
+      dash.appendChild(
+        tile("VRAM du cluster", agg.totalVram > 0 ? go(agg.usedVram * 1073741824) + " / " + go(agg.totalVram * 1073741824) : "—"),
+      );
+      dash.appendChild(
+        tile("RAM du cluster", agg.totalRam > 0 ? go(agg.usedRam * 1073741824) + " / " + go(agg.totalRam * 1073741824) : "—"),
+      );
+      dash.appendChild(tile("CPU moyen", agg.totalRam > 0 ? Math.round(agg.avgCpu) + " %" : "—"));
+      section.appendChild(dash);
+
+      var list = el("div", "cs-list");
       var self = this;
       this.members.forEach(function (m) {
-        var pretes = [];
-        if (m.gpu) pretes.push("carte");
-        if (m.ram) pretes.push("mémoire vive");
-        if (m.storage) pretes.push("stockage");
-        var hint = m.sharing
-          ? "Prête " + (pretes.join(", ") || "rien") + (m.lendable_gb > 0 ? " · " + m.lendable_gb.toFixed(1) + " Go de calcul" : "")
-          : "Membre, ne prête rien";
-        list.appendChild(self.row(m.name, m.address + " · " + hint, el("span", "cs-tag" + (m.sharing ? " ok" : ""), m.sharing ? "Partage" : "Inactif")));
+        list.appendChild(self.memberCard(m));
       });
       section.appendChild(list);
       return section;
+    }
+
+    memberCard(m) {
+      var pretes = [];
+      if (m.gpu) pretes.push("carte");
+      if (m.ram) pretes.push("mémoire vive");
+      if (m.storage) pretes.push("stockage");
+      var hint =
+        (m.is_self ? "Cette machine" : m.address) +
+        " · " +
+        (m.sharing
+          ? "Prête " + (pretes.join(", ") || "rien") + (m.lendable_gb > 0 ? " · " + m.lendable_gb.toFixed(1) + " Go de calcul" : "")
+          : "Membre, ne prête rien");
+
+      var card = el("div", "cs-member");
+      var head = el("div", "cs-row");
+      head.style.borderTop = "0";
+      var t = el("div", "cs-grow");
+      var titre = el("div", "cs-label", m.name + (m.gpu_name ? " — " + m.gpu_name : ""));
+      t.appendChild(titre);
+      t.appendChild(el("div", "cs-hint", hint));
+      head.appendChild(t);
+      head.appendChild(el("span", "cs-tag" + (m.sharing ? " ok" : ""), m.sharing ? "Partage" : "Inactif"));
+      card.appendChild(head);
+
+      var mesure = m.total_ram_gb > 0;
+      if (mesure) {
+        var stats = el("div", "cs-member-stats");
+        if (m.total_vram_gb > 0) {
+          var vramUse = Math.max(0, m.total_vram_gb - m.free_vram_gb);
+          stats.appendChild(
+            this.meter(
+              "VRAM · " + vramUse.toFixed(1) + " / " + m.total_vram_gb.toFixed(1) + " Go",
+              (vramUse / m.total_vram_gb) * 100,
+            ),
+          );
+        }
+        var ramUse = Math.max(0, m.total_ram_gb - m.free_ram_gb);
+        stats.appendChild(
+          this.meter("RAM · " + ramUse.toFixed(1) + " / " + m.total_ram_gb.toFixed(1) + " Go", (ramUse / m.total_ram_gb) * 100),
+        );
+        stats.appendChild(this.meter("CPU · " + Math.round(m.cpu_usage_percent) + " %", m.cpu_usage_percent));
+        card.appendChild(stats);
+      }
+      return card;
     }
   }
 

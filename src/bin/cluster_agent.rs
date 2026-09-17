@@ -632,7 +632,8 @@ async fn local_capability(state: &Shared) -> Capability {
         reap_worker(&mut s);
         (s.rpc_child.is_some(), s.devices.clone(), s.lent.clone())
     };
-    let (gpu_name, free_vram_gb) = probe_gpu(&devices).await;
+    let ((gpu_name, free_vram_gb, total_vram_gb), (cpu_usage_percent, total_ram_gb, free_ram_gb)) =
+        tokio::join!(probe_gpu(&devices), sample_cpu_ram());
     Capability {
         name: hostname(),
         os: std::env::consts::OS.to_string(),
@@ -646,6 +647,10 @@ async fn local_capability(state: &Shared) -> Capability {
         } else {
             0.0
         },
+        total_vram_gb,
+        total_ram_gb,
+        free_ram_gb,
+        cpu_usage_percent,
     }
 }
 
@@ -662,17 +667,18 @@ fn hostname() -> String {
     }
 }
 
-/// La VRAM **libre** — pas la VRAM totale, qui ne dit rien de ce qu'un autre
-/// modèle occupe déjà.
+/// Le nom de la carte, sa VRAM **libre** — pas la totale, qui ne dit rien de
+/// ce qu'un autre modèle occupe déjà — et sa VRAM totale, pour que le
+/// tableau de bord puisse dessiner une barre plutôt qu'un nombre seul.
 ///
 /// Dans l'ordre : `nvidia-smi`, puis la liste des appareils de llama.cpp (qui
 /// connaît aussi les cartes AMD, Intel et Apple), puis `LOCARYN_VRAM_GB` (la
-/// VRAM totale mesurée par l'hôte) — mieux vaut un nombre pessimiste et
-/// signalé qu'un nombre inventé.
-async fn probe_gpu(devices: &[RpcDevice]) -> (Option<String>, f32) {
+/// VRAM totale mesurée par l'hôte, sans le libre — mieux vaut un total seul
+/// qu'un nombre inventé pour le reste).
+async fn probe_gpu(devices: &[RpcDevice]) -> (Option<String>, f32, f32) {
     let mut cmd = tokio::process::Command::new("nvidia-smi");
     cmd.args([
-        "--query-gpu=name,memory.free",
+        "--query-gpu=name,memory.free,memory.total",
         "--format=csv,noheader,nounits",
     ]);
     cluster::launch::hide_console(&mut cmd);
@@ -682,9 +688,14 @@ async fn probe_gpu(devices: &[RpcDevice]) -> (Option<String>, f32) {
             if let Some(ligne) = texte.lines().next() {
                 let mut parts = ligne.split(',');
                 let nom = parts.next().map(|s| s.trim().to_string());
-                let mio: Option<f32> = parts.next().and_then(|s| s.trim().parse().ok());
-                if let (Some(nom), Some(mio)) = (nom, mio) {
-                    return (Some(nom), mio / 1024.0);
+                let libre_mio: Option<f32> = parts.next().and_then(|s| s.trim().parse().ok());
+                let total_mio: Option<f32> = parts.next().and_then(|s| s.trim().parse().ok());
+                if let (Some(nom), Some(libre_mio)) = (nom, libre_mio) {
+                    return (
+                        Some(nom),
+                        libre_mio / 1024.0,
+                        total_mio.unwrap_or(0.0) / 1024.0,
+                    );
                 }
             }
         }
@@ -697,12 +708,31 @@ async fn probe_gpu(devices: &[RpcDevice]) -> (Option<String>, f32) {
         return (
             Some(carte.description.clone()),
             carte.free_mib as f32 / 1024.0,
+            carte.total_mib as f32 / 1024.0,
         );
     }
     let total = std::env::var("LOCARYN_VRAM_GB")
         .ok()
-        .and_then(|s| s.parse::<f32>().ok());
-    (None, total.unwrap_or(0.0))
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.0);
+    (None, total, total)
+}
+
+/// CPU (moyenne tous cœurs, 0-100) et mémoire vive, mesurés en direct.
+///
+/// `sysinfo` exige deux lectures espacées pour une charge CPU qui veuille
+/// dire quelque chose : la première pose la référence, l'attente minimale
+/// de la bibliothèque sépare les deux prises.
+async fn sample_cpu_ram() -> (f32, f32, f32) {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_usage();
+    tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+    let cpu = sys.global_cpu_usage();
+    let total_ram_gb = sys.total_memory() as f32 / 1_073_741_824.0;
+    let free_ram_gb = sys.available_memory() as f32 / 1_073_741_824.0;
+    (cpu, total_ram_gb, free_ram_gb)
 }
 
 // ============================================================================
@@ -722,6 +752,9 @@ async fn shared_models_view(state: &Shared) -> AgentResponse {
         Ok(d) => d,
         Err(message) => return AgentResponse::Error { message },
     };
+    // Prise avant le verrou : `local_capability` verrouille `state` elle
+    // aussi (pour relever les processus morts), la tenir ici bloquerait.
+    let local_cap = local_capability(state).await;
     let s = state.lock().await;
     if !s.prefs.as_ref().is_some_and(|p| p.coordinator) {
         return not_coordinator();
@@ -770,9 +803,40 @@ async fn shared_models_view(state: &Shared) -> AgentResponse {
                     0.0
                 },
                 last_seen_unix: p.last_seen_unix,
+                is_self: false,
+                os: p.capability.os.clone(),
+                gpu_name: p.capability.gpu_name.clone(),
+                free_vram_gb: p.capability.free_vram_gb,
+                total_vram_gb: p.capability.total_vram_gb,
+                free_ram_gb: p.capability.free_ram_gb,
+                total_ram_gb: p.capability.total_ram_gb,
+                cpu_usage_percent: p.capability.cpu_usage_percent,
             }
         })
         .collect();
+    let local_partage = s.prefs.clone().unwrap_or_default();
+    members.push(MemberView {
+        name: local_cap.name.clone(),
+        address: "local".into(),
+        sharing: local_partage.enabled,
+        gpu: local_partage.enabled && local_partage.gpu,
+        ram: local_partage.enabled && local_partage.ram,
+        storage: local_partage.enabled && local_partage.storage,
+        lendable_gb: if s.rpc_child.is_some() {
+            local_cap.lendable_gb()
+        } else {
+            0.0
+        },
+        last_seen_unix: unix_now(),
+        is_self: true,
+        os: local_cap.os.clone(),
+        gpu_name: local_cap.gpu_name.clone(),
+        free_vram_gb: local_cap.free_vram_gb,
+        total_vram_gb: local_cap.total_vram_gb,
+        free_ram_gb: local_cap.free_ram_gb,
+        total_ram_gb: local_cap.total_ram_gb,
+        cpu_usage_percent: local_cap.cpu_usage_percent,
+    });
     members.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     AgentResponse::SharedModels {
         models: vues,

@@ -105,6 +105,23 @@ pub struct Capability {
     /// partage — la VRAM libre fait alors foi, comme avant.
     #[serde(default)]
     pub offered_memory_gb: f32,
+    /// VRAM totale de la carte retenue, en gibioctets. Zéro : inconnue (pas
+    /// de `nvidia-smi`, aucun appareil GPU annoncé par llama.cpp) — le
+    /// tableau de bord affiche alors la VRAM libre seule plutôt qu'une barre
+    /// dont le total serait inventé.
+    #[serde(default)]
+    pub total_vram_gb: f32,
+    /// Mémoire vive totale de la machine, en gibioctets.
+    #[serde(default)]
+    pub total_ram_gb: f32,
+    /// Mémoire vive libre au moment de l'annonce, en gibioctets.
+    #[serde(default)]
+    pub free_ram_gb: f32,
+    /// Charge CPU instantanée (moyenne tous cœurs), de 0 à 100. Un ancien
+    /// pair qui ne l'annonce pas encore reste à zéro — pas une charge nulle
+    /// réelle, une valeur absente.
+    #[serde(default)]
+    pub cpu_usage_percent: f32,
 }
 
 impl Capability {
@@ -218,6 +235,10 @@ mod tests {
             has_llama_server: true,
             has_rpc_server: false,
             offered_memory_gb: 0.0,
+            total_vram_gb: 8.0,
+            total_ram_gb: 32.0,
+            free_ram_gb: 16.0,
+            cpu_usage_percent: 0.0,
         };
         assert!(!cap.can_serve());
     }
@@ -235,6 +256,10 @@ mod tests {
             has_llama_server: true,
             has_rpc_server: true,
             offered_memory_gb: 12.0,
+            total_vram_gb: 0.0,
+            total_ram_gb: 32.0,
+            free_ram_gb: 16.0,
+            cpu_usage_percent: 0.0,
         };
         assert!(cap.can_serve());
         assert_eq!(cap.lendable_gb(), 12.0);

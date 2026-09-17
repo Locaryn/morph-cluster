@@ -183,6 +183,27 @@ pub struct MemberView {
     pub storage: bool,
     pub lendable_gb: f32,
     pub last_seen_unix: u64,
+    /// Vrai pour la machine qui répond — le coordinateur ajoute sa propre
+    /// ligne, sans quoi les totaux du tableau de bord manqueraient sa part.
+    #[serde(default)]
+    pub is_self: bool,
+    /// Ce qui suit vient tel quel de la dernière capacité annoncée par ce
+    /// pair — le tableau de bord de performance du panneau. Zéro partout
+    /// chez un pair jamais vu ou trop ancien pour l'annoncer.
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub gpu_name: Option<String>,
+    #[serde(default)]
+    pub free_vram_gb: f32,
+    #[serde(default)]
+    pub total_vram_gb: f32,
+    #[serde(default)]
+    pub free_ram_gb: f32,
+    #[serde(default)]
+    pub total_ram_gb: f32,
+    #[serde(default)]
+    pub cpu_usage_percent: f32,
 }
 
 /// L'état d'un modèle partagé sur ce poste.

@@ -1,6 +1,6 @@
 [package]
 name = "locaryn-plugin-cluster"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Official Locaryn Extension: pool GPU VRAM across networked machines via llama.cpp RPC to run models too large for one card"
 license = "Apache-2.0"
@@ -37,5 +37,9 @@ hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# CPU et mémoire vive de la machine, pour le tableau de bord de perf du
+# cluster (nom du GPU et VRAM restent sondés par nvidia-smi / llama.cpp,
+# sysinfo ne les couvre pas de façon fiable sur toutes les cartes).
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 [workspace]

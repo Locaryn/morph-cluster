@@ -1,6 +1,6 @@
 [package]
 name = "locaryn-plugin-cluster"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Official Locaryn Extension: pool GPU VRAM across networked machines via llama.cpp RPC to run models too large for one card"
 license = "Apache-2.0"

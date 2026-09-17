@@ -151,7 +151,7 @@ async fn main() {
     tokio::spawn(run_local_ipc(local_listener, agent.clone()));
     tokio::spawn(run_peer_listener(peer_listener, agent.clone()));
     tokio::spawn(run_beacon_sender(peer_port, agent.state.clone()));
-    tokio::spawn(run_beacon_listener(agent.clone()));
+    tokio::spawn(run_beacon_listener(agent.clone(), peer_port));
     tokio::spawn(run_peer_refresh(agent.clone()));
     tokio::spawn(run_sync(agent.clone()));
 
@@ -1370,7 +1370,7 @@ async fn run_beacon_sender(ctrl_port: u16, state: Shared) {
     }
 }
 
-async fn run_beacon_listener(agent: Agent) {
+async fn run_beacon_listener(agent: Agent, mon_ctrl_port: u16) {
     let Ok(socket) = UdpSocket::bind(("0.0.0.0", cluster::DISCOVERY_UDP_PORT)).await else {
         eprintln!(
             "[cluster-agent] port de découverte {} indisponible — une autre instance tourne \
@@ -1387,6 +1387,15 @@ async fn run_beacon_listener(agent: Agent) {
         let Some(beacon) = Beacon::decode(&buf[..n]) else {
             continue;
         };
+        // Une diffusion revient souvent à son émetteur (bouclage réseau
+        // fréquent sous WSL et certaines configurations Wi-Fi) : sans ce
+        // garde-fou, la machine s'appairait avec elle-même et le tableau de
+        // bord comptait ses propres ressources deux fois. Le port de
+        // contrôle annoncé, tiré au hasard par machine, suffit à s'en
+        // distinguer sans avoir à comparer des adresses IP.
+        if beacon.ctrl_port == mon_ctrl_port {
+            continue;
+        }
         let fp_attendue = {
             let s = agent.state.lock().await;
             s.identity

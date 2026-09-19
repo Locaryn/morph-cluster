@@ -55,11 +55,13 @@ serveur RPC.
 3. Depuis la première machine : `cluster_peers` (la découverte prend jusqu'à
    une dizaine de secondes après le démarrage des deux agents) pour vérifier
    que les autres machines apparaissent, avec leur VRAM libre.
-4. `cluster_plan` avec la taille du fichier GGUF visé (en Go) : dit si la
-   capacité cumulée suffit, et lesquels des pairs seraient retenus. **Faites
-   toujours cet appel avant de proposer le moteur Cluster GPU** — le
-   démarrage refait le même calcul et échoue pour la même raison si ça ne
-   suffit pas, mais après avoir commencé à charger.
+4. `cluster_launch_plan` avec la taille du fichier GGUF visé (en Go) : dit ce
+   que le moteur fera — **entier sur cette machine** (rapide), **découpé** sur
+   des pairs (plus lent), ou **refusé** avec la raison. **Faites toujours cet
+   appel avant de proposer le moteur Cluster GPU.** Le découpage est
+   **désactivé par défaut** : ne l'activez (`cluster_routing_set`) que si la
+   personne l'a demandé, en lui disant que c'est plus lent. `cluster_plan`
+   donne seulement la capacité brute du découpage.
 5. Si un pair semble lent, `cluster_bench` avant de s'inquiéter d'un mauvais
    plan : au-delà de 150 ms d'aller-retour de contrôle, le pair est écarté
    automatiquement, et un lien lent (Wi-Fi faible) ralentit souvent plus
@@ -71,8 +73,14 @@ serveur RPC.
 
 - **La capacité cumulée est un plafond réel**, pas un objectif. Un modèle
   dont la taille dépasse la somme des VRAM utilisables (après la marge de
-  sécurité de 10 %) ne tournera pas — `cluster_plan` le dit avant, avec le
-  manque exact en gigaoctets. Ne pas suggérer de contourner ce chiffre.
+  sécurité de 10 %) ne tournera pas — `cluster_launch_plan` le dit avant, avec
+  le manque exact en gigaoctets. Ne pas suggérer de contourner ce chiffre.
+- **Découper est plus lent, pas plus rapide.** Un modèle qui tient sur la
+  machine y tourne entier même quand des pairs sont disponibles. Ne jamais
+  présenter le cluster comme un moyen d'accélérer un modèle qui tient déjà.
+- **Répartir des requêtes indépendantes sur plusieurs machines n'est pas
+  écrit.** Le jour où ce sera fait, ce sera par `morph-omniroute` (à installer
+  aussi) ; aujourd'hui, ne pas le promettre.
 - **Ce n'est que du GGUF.** Un checkpoint safetensors ne passe pas par ce
   moteur.
 - **La sécurité du pairage n'est pas celle du calcul lui-même.** Le pairage

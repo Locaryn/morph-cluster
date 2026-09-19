@@ -1,10 +1,13 @@
 //! Lanceur du moteur Cluster — le programme que le socle nomme dans
 //! `engine.lifecycle.start`.
 //!
-//! À chaque démarrage : s'assure que l'agent tourne, lui demande le plan de
-//! répartition courant pour ce modèle, s'assure que les pairs retenus ont
-//! bien démarré leur `ggml-rpc-server`, puis lance `llama-server --rpc …`
-//! et **devient** ce processus sous Linux/macOS (comme le lanceur FreeToken :
+//! À chaque démarrage : s'assure que l'agent tourne et lui demande ce qu'il
+//! faut faire de ce modèle. S'il tient sur cette machine, `llama-server` le
+//! charge entier ici, sans réseau. Sinon, et seulement si la personne a
+//! autorisé le découpage, il s'assure que les pairs retenus ont bien démarré
+//! leur `ggml-rpc-server` puis lance `llama-server --rpc …` ; sans cette
+//! autorisation, le modèle est refusé avec la raison. Le lanceur
+//! **devient** ensuite ce processus sous Linux/macOS (comme le lanceur FreeToken :
 //! un maillon de moins entre ce que le socle surveille et ce qui répond
 //! vraiment). Sous Windows, `llama-server.exe` n'a pas d'équivalent à
 //! `exec()` ; le lanceur reste en surveillance et relaie le code de sortie.
@@ -14,6 +17,7 @@ use locaryn_plugin_cluster::agent_client;
 use locaryn_plugin_cluster::agent_protocol::{AgentRequest, AgentResponse};
 use locaryn_plugin_cluster::discovery::{ControlRequest, ControlResponse};
 use locaryn_plugin_cluster::identity::ClusterIdentity;
+use locaryn_plugin_cluster::mode::LaunchDecision;
 use std::process::ExitCode;
 
 #[tokio::main]
@@ -68,12 +72,11 @@ async fn serve(args: &[String]) -> ExitCode {
         .map(|m| m.len() as f32 / 1_073_741_824.0)
         .unwrap_or(0.0);
 
-    // Le plan courant : quels pairs, dans quel ordre. Sans cluster créé, la
-    // liste des pairs est vide et le plan ne compte que la machine locale —
-    // ce lanceur reste alors un llama-server ordinaire, ce qui est le
-    // comportement honnête quand personne n'a rejoint.
-    let plan = match agent_client::send(&AgentRequest::Plan { model_size_gb }).await {
-        Ok(AgentResponse::Plan { plan }) => plan,
+    // La décision courante : entier ici, découpé sur des pairs, ou refusé. Elle
+    // est prise par l'agent, qui connaît les pairs et le choix de la personne —
+    // l'aperçu (`cluster_launch_plan`) et ce lancement lisent la même réponse.
+    let decision = match agent_client::send(&AgentRequest::Launch { model_size_gb }).await {
+        Ok(AgentResponse::Launch { decision }) => decision,
         Ok(AgentResponse::Error { message }) => {
             eprintln!("[cluster] agent : {message}");
             return ExitCode::FAILURE;
@@ -88,19 +91,22 @@ async fn serve(args: &[String]) -> ExitCode {
         }
     };
 
-    if !plan.sufficient {
-        eprintln!(
-            "[cluster] capacité insuffisante : {:.1} Go utilisables pour un modèle de {:.1} Go \
-             (il manque {:.1} Go). Ajoutez un pair (cluster_peers), ou faites-lui démarrer son \
-             GPU (cluster_worker_start) avant de réessayer.",
-            plan.usable_capacity_gb, plan.model_size_gb, plan.shortfall_gb
-        );
-        return ExitCode::FAILURE;
-    }
-
-    for exclu in &plan.excluded {
-        eprintln!("[cluster] pair {} écarté : {}", exclu.peer_id, exclu.reason);
-    }
+    let plan = match decision {
+        LaunchDecision::Local {
+            model_size_gb,
+            usable_gb,
+        } => {
+            eprintln!(
+                "[cluster] le modèle ({model_size_gb:.1} Go) tient sur cette machine ({usable_gb:.1} Go utilisables) : exécution locale, sans réseau, à pleine vitesse"
+            );
+            None
+        }
+        LaunchDecision::Refuse { message } => {
+            eprintln!("[cluster] {message}");
+            return ExitCode::FAILURE;
+        }
+        LaunchDecision::Split { plan } => Some(plan),
+    };
 
     // S'assurer que chaque pair retenu a bien démarré son serveur RPC — le
     // plan reflète l'état connu au moment du calcul, qui peut dater de
@@ -111,22 +117,25 @@ async fn serve(args: &[String]) -> ExitCode {
     // processus séparé de l'agent, mais le secret du cluster n'a pas besoin
     // de transiter par lui pour ça — il vit dans le même dossier d'état, lu
     // par l'utilisateur qui exécute Locaryn, comme l'agent le fait lui-même.
-    let identity = ClusterIdentity::load(&cluster::state_dir());
-    for membre in &plan.members {
-        let Some(identity) = &identity else {
-            eprintln!(
-                "[cluster] {} : aucune identité de cluster localement — impossible de \
-                 s'authentifier auprès des pairs",
-                membre.peer_id
-            );
-            break;
-        };
-        if let Err(e) = ensure_peer_rpc(&membre.address, &identity.secret).await {
-            eprintln!(
-                "[cluster] {} ({}) n'a pas pu démarrer son serveur RPC : {e} — exclu de ce \
-                 lancement",
-                membre.peer_id, membre.address
-            );
+    if let Some(plan) = &plan {
+        for exclu in &plan.excluded {
+            eprintln!("[cluster] pair {} écarté : {}", exclu.peer_id, exclu.reason);
+        }
+        let identity = ClusterIdentity::load(&cluster::state_dir());
+        for membre in &plan.members {
+            let Some(identity) = &identity else {
+                eprintln!(
+                    "[cluster] {} : aucune identité de cluster localement — impossible de s'authentifier auprès des pairs",
+                    membre.peer_id
+                );
+                break;
+            };
+            if let Err(e) = ensure_peer_rpc(&membre.address, &identity.secret).await {
+                eprintln!(
+                    "[cluster] {} ({}) n'a pas pu démarrer son serveur RPC : {e} — exclu de ce lancement",
+                    membre.peer_id, membre.address
+                );
+            }
         }
     }
 
@@ -149,15 +158,11 @@ async fn serve(args: &[String]) -> ExitCode {
         "-m".to_string(),
         model,
     ];
-    let rpc_arg = plan.rpc_argument();
+    let rpc_arg = plan.as_ref().map(|p| p.rpc_argument()).unwrap_or_default();
     if !rpc_arg.is_empty() {
         cmd_args.push("--rpc".to_string());
         cmd_args.push(rpc_arg.clone());
-        eprintln!("[cluster] --rpc {rpc_arg}");
-    } else {
-        eprintln!(
-            "[cluster] aucun pair retenu — exécution locale, comme un llama-server ordinaire"
-        );
+        eprintln!("[cluster] modèle découpé — --rpc {rpc_arg} (plus lent : chaque jeton traverse le réseau)");
     }
 
     #[cfg(unix)]

@@ -36,6 +36,7 @@ pub mod discovery;
 pub mod hmac_auth;
 pub mod identity;
 pub mod launch;
+pub mod mode;
 pub mod peer_channel;
 pub mod plan;
 pub mod sharing;

@@ -65,6 +65,43 @@ cours avec sa progression, en attente, place insuffisante (avec ce qui manque).
 
 ---
 
+## Entier sur une machine, ou découpé : votre choix
+
+Découper un modèle sur deux PC en laisse passer un qu'aucun ne porte seul, mais
+**chaque jeton traverse alors le réseau** : c'est plus lent que n'importe quelle
+machine seule. Le moteur « Cluster GPU » suit donc cette règle :
+
+1. **Le modèle tient sur la machine qui pilote la conversation** → il y tourne
+   **entier, sans réseau, à pleine vitesse**, même si d'autres machines sont
+   disponibles.
+2. **Il ne tient pas, et le découpage est désactivé** (le réglage par défaut) →
+   il est refusé, avec la raison, ce qui manque, et le nom d'une machine qui le
+   porterait seule quand il y en a une.
+3. **Il ne tient pas, et vous avez activé le découpage** → il est réparti sur
+   les machines qui prêtent leur carte (llama.cpp RPC), en acceptant la lenteur.
+
+Le réglage est dans Réglages → Compte → Partage de ressources → **« Répartition
+des modèles »** (« Découper un gros modèle sur plusieurs machines »), ou par
+l'outil `cluster_routing_set`. `cluster_launch_plan` montre ce que le lancement
+ferait d'un modèle donné, sans le lancer.
+
+### À venir : répartir des requêtes indépendantes (nécessitera `morph-omniroute`)
+
+Un modèle entier sur une machine ne profite pas des autres. Pour utiliser
+plusieurs machines **en parallèle** — plusieurs agents, un lot de documents,
+chaque requête tournant à pleine vitesse sur une machine — il faut un
+**routeur** qui choisisse la machine de chaque requête. Ce routeur existe déjà :
+c'est [OmniRoute](https://github.com/diegosouzapw/OmniRoute) (stratégies
+`round-robin`, `p2c`, `least-used`, disjoncteurs, fournisseurs compatibles
+OpenAI). Ce morph ne le réécrira pas : il fournira les machines, OmniRoute
+répartira les requêtes.
+
+> **Pas encore disponible.** Cette fonction n'est pas écrite. Quand elle le
+> sera, elle **demandera que le morph `morph-omniroute` soit aussi installé** ;
+> le découpage d'un gros modèle décrit ci-dessus, lui, n'en dépend pas.
+
+---
+
 ## Sans serveur : le cluster monté à la main
 
 Les outils de la version 0.1 restent là, pour un réseau sans serveur Locaryn :

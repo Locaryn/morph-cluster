@@ -180,13 +180,40 @@ fn tools_list() -> Value {
             },
             {
                 "name": "cluster_plan",
-                "description": "Calcule si les pairs actuellement joignables ont assez de VRAM cumulée pour un modèle de cette taille, et lesquels seraient retenus. À appeler avant de choisir ce moteur dans Réglages → Moteur, pour prévenir l'utilisateur si la capacité manque — le lancement fera le même calcul et refusera pour la même raison.",
+                "description": "Calcule si les pairs actuellement joignables ont assez de VRAM cumulée pour DÉCOUPER un modèle de cette taille, et lesquels seraient retenus. C'est la capacité brute du découpage : pour savoir ce que le lancement fera réellement (entier ici, découpé ou refusé), appeler cluster_launch_plan.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "model_size_gb": { "type": "number", "description": "Taille du fichier GGUF visé, en gigaoctets." }
                     },
                     "required": ["model_size_gb"]
+                }
+            },
+            {
+                "name": "cluster_launch_plan",
+                "description": "Ce que le moteur « Cluster GPU » ferait d'un modèle de cette taille, avec le réglage actuel : tourner ENTIER sur cette machine (rapide, sans réseau), être découpé sur des pairs (plus lent, seulement si c'est autorisé), ou être refusé avec la raison. À appeler avant de choisir ce moteur.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "model_size_gb": { "type": "number", "description": "Taille du fichier GGUF visé, en gigaoctets." }
+                    },
+                    "required": ["model_size_gb"]
+                }
+            },
+            {
+                "name": "cluster_routing_get",
+                "description": "Si le découpage d'un gros modèle sur plusieurs machines est autorisé (split_models). Désactivé par défaut : un modèle qui tient sur la machine y tourne entier, à pleine vitesse.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "cluster_routing_set",
+                "description": "Autorise ou interdit le découpage d'un gros modèle sur plusieurs machines. Activé, un modèle qui ne tient pas sur la machine est réparti sur des pairs — plus lent, car chaque jeton traverse le réseau. C'est le choix de la personne : ne l'appeler que sur sa demande explicite.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "split_models": { "type": "boolean", "description": "Vrai pour autoriser le découpage, faux pour l'interdire." }
+                    },
+                    "required": ["split_models"]
                 }
             },
             {
@@ -360,6 +387,30 @@ async fn call_tool(nom: &str, args: Value) -> Result<Value, String> {
                 AgentResponse::Plan { plan } => Ok(serde_json::to_value(plan).unwrap_or(json!({}))),
                 other => unexpected(other),
             }
+        }
+        "cluster_launch_plan" => {
+            let taille = args
+                .get("model_size_gb")
+                .and_then(Value::as_f64)
+                .ok_or("« model_size_gb » est requis")?;
+            match agent_client::send(&AgentRequest::Launch {
+                model_size_gb: taille as f32,
+            })
+            .await?
+            {
+                AgentResponse::Launch { decision } => {
+                    Ok(serde_json::to_value(decision).unwrap_or(json!({})))
+                }
+                other => unexpected(other),
+            }
+        }
+        "cluster_routing_get" => as_value(agent_client::send(&AgentRequest::RoutingGet).await?),
+        "cluster_routing_set" => {
+            let split_models = args
+                .get("split_models")
+                .and_then(Value::as_bool)
+                .ok_or("« split_models » est requis")?;
+            as_value(agent_client::send(&AgentRequest::RoutingSet { split_models }).await?)
         }
         "cluster_bench" => {
             let peer_id = args

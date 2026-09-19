@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// restera au moment du chargement — le système d'exploitation, l'affichage,
 /// une autre application en prennent un peu. Réserver 10 % évite un échec de
 /// chargement à 95 % rempli.
-const MARGE_SECURITE: f32 = 0.10;
+pub(crate) const MARGE_SECURITE: f32 = 0.10;
 
 /// Le plan calculé pour un modèle donné.
 #[derive(Debug, Clone, Serialize, Deserialize)]

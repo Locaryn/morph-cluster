@@ -211,6 +211,7 @@
             ? await api.server.connection()
             : { mode: "local" };
         this.share = await localTool("cluster_share_get");
+        this.routing = await localTool("cluster_routing_get");
         if (this.isServer()) {
           if (!this.enrolled) {
             await localTool("cluster_enroll");
@@ -312,6 +313,15 @@
       });
     }
 
+    setSplit(value) {
+      var self = this;
+      return this.run(async function () {
+        self.routing = await localTool("cluster_routing_set", { split_models: value });
+      }, value
+        ? "Le découpage sur plusieurs machines est autorisé."
+        : "Le découpage est désactivé : un modèle tourne entier sur une seule machine.");
+    }
+
     toggleModel(file, enabled) {
       var self = this;
       this.pendingModel = file;
@@ -352,12 +362,46 @@
         return;
       }
       if (this.isClient()) this.appendChild(this.renderMachine());
+      this.appendChild(this.renderRouting());
       this.appendChild(this.renderModels());
       // Le tableau de bord vient du coordinateur (`shared_models_view`), qui
       // répond aussi bien à un appel local qu'à un appel relayé depuis un
       // poste client (`server.invokeTool`) — pas de raison de le réserver
       // au serveur.
       this.appendChild(this.renderMembers());
+    }
+
+    /** Découper ou non un gros modèle : désactivé par défaut, parce que faire
+     *  traverser le réseau à chaque jeton ralentit — un modèle qui tient sur la
+     *  machine y tourne entier, à pleine vitesse. */
+    renderRouting() {
+      var self = this;
+      var on = !!(this.routing && this.routing.split_models);
+      var section = el("section", "cs-section");
+      var head = el("div", "cs-head");
+      head.appendChild(el("div", "cs-title", "Répartition des modèles"));
+      section.appendChild(head);
+      section.appendChild(
+        el(
+          "p",
+          "cs-sub",
+          "Un modèle qui tient sur la machine y tourne entier, à pleine vitesse, même quand d'autres machines sont disponibles.",
+        ),
+      );
+      var main = el("div", "cs-main");
+      main.appendChild(
+        this.row(
+          "Découper un gros modèle sur plusieurs machines",
+          on
+            ? "Activé : un modèle qui ne tient pas ici est réparti sur les autres machines. Plus lent — chaque jeton traverse le réseau."
+            : "Désactivé : un modèle trop gros pour cette machine est refusé, avec la raison. Activez-le pour accepter un modèle plus gros, mais plus lent.",
+          this.switchButton(on, "Découper un gros modèle sur plusieurs machines", function (v) {
+            self.setSplit(v);
+          }, this.busy),
+        ),
+      );
+      section.appendChild(main);
+      return section;
     }
 
     renderLocal() {

@@ -31,6 +31,7 @@ use locaryn_plugin_cluster::discovery::{
 };
 use locaryn_plugin_cluster::hmac_auth::ResponderHandshake;
 use locaryn_plugin_cluster::identity::ClusterIdentity;
+use locaryn_plugin_cluster::mode::{self, RoutingConfig};
 use locaryn_plugin_cluster::peer_channel::{self, read_json_line, write_json_line};
 use locaryn_plugin_cluster::sharing::{self, RpcDevice, SharePrefs, SharingAnnounce};
 use locaryn_plugin_cluster::{transfer, Capability, Peer};
@@ -54,6 +55,8 @@ struct AgentState {
     rpc_port: Option<u16>,
     /// `None` : aucun choix enregistré (cluster monté à la main).
     prefs: Option<SharePrefs>,
+    /// Découper ou non un gros modèle sur plusieurs machines. Interdit par défaut.
+    routing: RoutingConfig,
     /// Les appareils que llama.cpp voit, lus une fois puis à la demande.
     devices: Vec<RpcDevice>,
     /// Les appareils passés à `-d` au dernier démarrage du serveur RPC.
@@ -98,6 +101,7 @@ async fn main() {
             rpc_child: None,
             rpc_port: None,
             prefs,
+            routing: RoutingConfig::load(&state_dir),
             devices: Vec::new(),
             lent: Vec::new(),
             worker_problem: None,
@@ -264,6 +268,29 @@ async fn handle_local_request(req: AgentRequest, agent: &Agent) -> AgentResponse
             let peers: Vec<Peer> = state.lock().await.peers.values().cloned().collect();
             let plan = cluster::plan::compute(model_size_gb, local_vram, &peers, None);
             AgentResponse::Plan { plan }
+        }
+        AgentRequest::Launch { model_size_gb } => {
+            let capacity = local_capability(state).await.run_capacity_gb();
+            let (peers, routing) = {
+                let s = state.lock().await;
+                (s.peers.values().cloned().collect::<Vec<Peer>>(), s.routing)
+            };
+            AgentResponse::Launch {
+                decision: mode::decide(model_size_gb, capacity, &peers, routing, None),
+            }
+        }
+        AgentRequest::RoutingGet => AgentResponse::Routing {
+            split_models: state.lock().await.routing.split_models,
+        },
+        AgentRequest::RoutingSet { split_models } => {
+            let routing = RoutingConfig { split_models };
+            if let Err(e) = routing.save(&cluster::state_dir()) {
+                return AgentResponse::Error {
+                    message: format!("choix impossible à enregistrer : {e}"),
+                };
+            }
+            state.lock().await.routing = routing;
+            AgentResponse::Routing { split_models }
         }
         AgentRequest::Bench { peer_id } => bench_peer(&peer_id, state).await,
         AgentRequest::Enroll => enroll(state).await,

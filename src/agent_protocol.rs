@@ -84,6 +84,18 @@ pub enum AgentRequest {
     Plan {
         model_size_gb: f32,
     },
+    /// Ce que le lancement d'un modèle de cette taille va faire : tourner
+    /// entier ici, être découpé sur des pairs, ou être refusé. C'est la
+    /// décision du lanceur, prise ici pour que l'aperçu et le lancement ne
+    /// puissent pas diverger.
+    Launch {
+        model_size_gb: f32,
+    },
+    /// Le choix « découper un gros modèle sur plusieurs machines ».
+    RoutingGet,
+    RoutingSet {
+        split_models: bool,
+    },
     /// Mesure l'aller-retour de contrôle vers un pair, et met à jour sa fiche.
     Bench {
         peer_id: String,
@@ -121,6 +133,12 @@ pub enum AgentResponse {
     WorkerStopped,
     Plan {
         plan: crate::plan::ClusterPlan,
+    },
+    Launch {
+        decision: crate::mode::LaunchDecision,
+    },
+    Routing {
+        split_models: bool,
     },
     Benched {
         peer_id: String,
@@ -256,6 +274,26 @@ mod tests {
             AgentRequest::CreateCluster { name } => assert_eq!(name, "atelier"),
             other => panic!("mauvaise variante : {other:?}"),
         }
+    }
+
+    /// Le choix du découpage voyage tel quel entre le panneau, le serveur MCP
+    /// et l'agent : un champ renommé d'un côté le remettrait à son défaut
+    /// sans que personne ne le voie.
+    #[test]
+    fn le_choix_de_decoupage_fait_l_aller_retour() {
+        let bytes = encode_request(&AgentRequest::RoutingSet { split_models: true });
+        let relu: AgentRequest = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert!(matches!(
+            relu,
+            AgentRequest::RoutingSet { split_models: true }
+        ));
+
+        let json = serde_json::to_string(&AgentResponse::Routing {
+            split_models: false,
+        })
+        .unwrap();
+        assert!(json.contains(r#""ok":"routing""#));
+        assert!(json.contains(r#""split_models":false"#));
     }
 
     #[test]

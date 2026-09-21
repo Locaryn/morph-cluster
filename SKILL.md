@@ -78,6 +78,12 @@ serveur RPC.
 - **Découper est plus lent, pas plus rapide.** Un modèle qui tient sur la
   machine y tourne entier même quand des pairs sont disponibles. Ne jamais
   présenter le cluster comme un moyen d'accélérer un modèle qui tient déjà.
+- **Le backend CUDA n'est pas un miracle.** Mesuré sur une RTX 4050 avec un petit
+  modèle : environ 12 % de génération en plus que Vulkan, pour ≈ 546 Mo de
+  téléchargement. Dire la taille avant d'appeler `cluster_backend_install`, et
+  ne jamais promettre un gain sans l'avoir mesuré (`llama-bench`).
+- **Le NPU Intel (OpenVINO) est expérimental** : à proposer seulement si la
+  personne le demande. Aucun binaire n'existe pour le NPU Qualcomm, Apple ou AMD.
 - **Répartir des requêtes indépendantes sur plusieurs machines n'est pas
   écrit.** Le jour où ce sera fait, ce sera par `morph-omniroute` (à installer
   aussi) ; aujourd'hui, ne pas le promettre.

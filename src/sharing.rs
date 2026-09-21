@@ -127,6 +127,13 @@ pub struct RpcDevice {
 }
 
 impl RpcDevice {
+    /// Le backend qui porte cet appareil : `CUDA0` → `CUDA`, `Vulkan1` → `Vulkan`.
+    pub fn backend_name(&self) -> String {
+        self.name
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .to_string()
+    }
+
     pub fn is_cpu(&self) -> bool {
         self.name.eq_ignore_ascii_case("cpu") || self.name.to_ascii_uppercase().starts_with("CPU")
     }

@@ -91,6 +91,16 @@ pub enum AgentRequest {
     Launch {
         model_size_gb: f32,
     },
+    /// Le backend de llama.cpp de cette machine : ce qui est installé, ce qui
+    /// serait recommandé, et l'avancement d'une installation en cours.
+    BackendStatus,
+    /// Installe un backend en tâche de fond (`None` : le recommandé). Un
+    /// téléchargement de plusieurs centaines de Mo ne bloque pas l'appel : le
+    /// panneau relit `BackendStatus` pour la progression.
+    BackendInstall {
+        #[serde(default)]
+        backend: Option<String>,
+    },
     /// Le choix « découper un gros modèle sur plusieurs machines ».
     RoutingGet,
     RoutingSet {
@@ -140,6 +150,9 @@ pub enum AgentResponse {
     Routing {
         split_models: bool,
     },
+    Backend {
+        status: BackendStatus,
+    },
     Benched {
         peer_id: String,
         round_trip_ms: u32,
@@ -176,6 +189,42 @@ pub enum AgentResponse {
     Error {
         message: String,
     },
+}
+
+/// Où en est une installation de backend lancée en tâche de fond.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackendJob {
+    pub backend: String,
+    /// Le fichier en cours de téléchargement.
+    pub file: String,
+    pub received_mb: u32,
+    /// `"downloading"`, `"done"` ou `"error"`.
+    pub state: String,
+    pub error: Option<String>,
+}
+
+/// L'état du backend de llama.cpp de cette machine, pour le panneau et les
+/// outils.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackendStatus {
+    pub hardware: crate::backend::Hardware,
+    /// Le backend que ce module choisirait pour cette machine.
+    pub recommended: String,
+    pub recommended_label: String,
+    /// Taille approximative du téléchargement recommandé, en Mo.
+    pub recommended_mb: Option<u32>,
+    /// Le backend installé par cette extension, s'il y en a un.
+    pub installed: Option<String>,
+    /// Le `llama-server` réellement utilisé, et s'il vient de cette extension.
+    pub in_use_path: Option<String>,
+    pub in_use_is_own: bool,
+    /// Ce que la machine dit charger réellement (`CUDA`, `Vulkan`…).
+    pub loaded_backend: Option<String>,
+    /// Une phrase quand un meilleur backend est disponible, sinon `None`.
+    pub suggestion: Option<String>,
+    /// Ce qu'il faut savoir sur le backend recommandé (taille, NPU expérimental…).
+    pub note: Option<String>,
+    pub job: Option<BackendJob>,
 }
 
 /// Un modèle de la bibliothèque du coordinateur, vu depuis le panneau.
@@ -222,6 +271,9 @@ pub struct MemberView {
     pub total_ram_gb: f32,
     #[serde(default)]
     pub cpu_usage_percent: f32,
+    /// Le backend de calcul que cette machine a chargé (`CUDA`, `Vulkan`…).
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 /// L'état d'un modèle partagé sur ce poste.

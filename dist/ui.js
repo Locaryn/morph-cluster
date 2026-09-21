@@ -212,6 +212,7 @@
             : { mode: "local" };
         this.share = await localTool("cluster_share_get");
         this.routing = await localTool("cluster_routing_get");
+        this.backend = await localTool("cluster_backend_status");
         if (this.isServer()) {
           if (!this.enrolled) {
             await localTool("cluster_enroll");
@@ -313,6 +314,13 @@
       });
     }
 
+    installBackend() {
+      var self = this;
+      return this.run(async function () {
+        self.backend = await localTool("cluster_backend_install", {});
+      }, "Installation lancée : elle continue en arrière-plan.");
+    }
+
     setSplit(value) {
       var self = this;
       return this.run(async function () {
@@ -363,6 +371,7 @@
       }
       if (this.isClient()) this.appendChild(this.renderMachine());
       this.appendChild(this.renderRouting());
+      this.appendChild(this.renderBackend());
       this.appendChild(this.renderModels());
       // Le tableau de bord vient du coordinateur (`shared_models_view`), qui
       // répond aussi bien à un appel local qu'à un appel relayé depuis un
@@ -400,6 +409,60 @@
           }, this.busy),
         ),
       );
+      section.appendChild(main);
+      return section;
+    }
+
+    /** Le backend de calcul de llama.cpp : ce qui tourne, ce qui conviendrait
+     *  mieux à cette machine, et l'avancement d'une installation. */
+    renderBackend() {
+      var self = this;
+      var b = this.backend && this.backend.status;
+      if (!b) return document.createDocumentFragment();
+      var job = b.job;
+      var enCours = !!job && job.state === "downloading";
+      var section = el("section", "cs-section");
+      var head = el("div", "cs-head");
+      head.appendChild(el("div", "cs-title", "Accélération du calcul"));
+      section.appendChild(head);
+      section.appendChild(
+        el(
+          "p",
+          "cs-sub",
+          "Le calcul est fait par llama.cpp. Le backend adapté au matériel de cette machine exploite mieux sa carte.",
+        ),
+      );
+      var main = el("div", "cs-main");
+      var actuel = b.loaded_backend
+        ? "llama.cpp charge : " + b.loaded_backend
+        : "Backend de calcul pas encore lu";
+      if (b.installed) actuel += " — installé par cette extension : " + b.installed;
+      main.appendChild(this.row("Backend actuel", actuel, null));
+
+      if (enCours) {
+        main.appendChild(
+          this.row("Téléchargement en cours", nomCourt(job.file || "") + " — " + job.received_mb + " Mo reçus", null),
+        );
+      } else if (b.suggestion) {
+        var bouton = el(
+          "button",
+          "locaryn-btn-ghost",
+          "Installer " + b.recommended_label + (b.recommended_mb ? " (≈ " + b.recommended_mb + " Mo)" : ""),
+        );
+        bouton.type = "button";
+        bouton.disabled = this.busy;
+        bouton.addEventListener("click", function () {
+          self.installBackend();
+        });
+        main.appendChild(this.row("Un backend plus adapté est disponible", b.suggestion, bouton));
+      }
+      if (job && job.state === "error") {
+        main.appendChild(el("p", "cs-msg err", "Installation échouée : " + (job.error || "erreur inconnue")));
+      }
+      if (job && job.state === "done") {
+        main.appendChild(el("p", "cs-msg", "Installé : " + job.backend + ". Il sert au prochain lancement du moteur."));
+      }
+      if (b.note) main.appendChild(el("p", "cs-hint", b.note));
       section.appendChild(main);
       return section;
     }
@@ -840,7 +903,7 @@
       var t = el("div", "cs-grow");
       var titre = el("div", "cs-label", m.name + (m.gpu_name ? " — " + m.gpu_name : ""));
       t.appendChild(titre);
-      t.appendChild(el("div", "cs-hint", hint));
+      t.appendChild(el("div", "cs-hint", hint + (m.backend ? " · " + m.backend : "")));
       head.appendChild(t);
       head.appendChild(el("span", "cs-tag" + (m.sharing ? " ok" : ""), m.sharing ? "Partage" : "Inactif"));
       card.appendChild(head);

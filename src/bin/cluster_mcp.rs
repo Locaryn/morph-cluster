@@ -190,6 +190,21 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "cluster_backend_status",
+                "description": "Le backend de calcul de llama.cpp sur cette machine : matériel détecté (pilote NVIDIA et sa version de CUDA, GPU Adreno, NPU Intel), backend installé par cette extension, backend recommandé avec la taille du téléchargement, ce que llama.cpp a réellement chargé (CUDA, Vulkan, Metal…), et l'avancement d'une installation en cours. À appeler avant de proposer d'installer un backend.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "cluster_backend_install",
+                "description": "Télécharge et installe une variante de llama.cpp adaptée à cette machine (CUDA pour une carte NVIDIA, processeur ARM ou Adreno sous Windows ARM, OpenVINO pour un NPU Intel…). Le téléchargement peut faire plusieurs centaines de Mo (CUDA ≈ 550 Mo) et remplace la variante installée : annoncer la taille et demander confirmation avant. Rend la main aussitôt ; suivre l'avancement avec cluster_backend_status. L'échange ne se fait qu'une fois l'archive vérifiée, l'ancienne variante reste intacte en cas d'échec.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "backend": { "type": "string", "description": "auto (le recommandé, par défaut), cuda, vulkan, cpu, openvino ou adreno. openvino cible le NPU Intel : expérimental, à ne proposer que sur demande." }
+                    }
+                }
+            },
+            {
                 "name": "cluster_launch_plan",
                 "description": "Ce que le moteur « Cluster GPU » ferait d'un modèle de cette taille, avec le réglage actuel : tourner ENTIER sur cette machine (rapide, sans réseau), être découpé sur des pairs (plus lent, seulement si c'est autorisé), ou être refusé avec la raison. À appeler avant de choisir ce moteur.",
                 "inputSchema": {
@@ -253,6 +268,7 @@ async fn call_tool(nom: &str, args: Value) -> Result<Value, String> {
                 "vram_libre_gio": self_capability.free_vram_gb,
                 "llama_server_present": self_capability.has_llama_server,
                 "ggml_rpc_server_present": self_capability.has_rpc_server,
+                "backend_charge": self_capability.backend,
                 "offre_son_gpu": worker_active,
                 "port_rpc_local": rpc_port,
                 "pairs_connus": peer_count,
@@ -387,6 +403,17 @@ async fn call_tool(nom: &str, args: Value) -> Result<Value, String> {
                 AgentResponse::Plan { plan } => Ok(serde_json::to_value(plan).unwrap_or(json!({}))),
                 other => unexpected(other),
             }
+        }
+        "cluster_backend_status" => {
+            as_value(agent_client::send(&AgentRequest::BackendStatus).await?)
+        }
+        "cluster_backend_install" => {
+            let backend = args
+                .get("backend")
+                .and_then(Value::as_str)
+                .filter(|b| !b.is_empty())
+                .map(str::to_string);
+            as_value(agent_client::send(&AgentRequest::BackendInstall { backend }).await?)
         }
         "cluster_launch_plan" => {
             let taille = args

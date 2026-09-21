@@ -6,7 +6,10 @@
 //! est déjà là), puis le chemin du système. Le premier qui contient le
 //! binaire gagne — jamais un mélange des trois.
 
+use crate::backend::{self, Backend};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 fn exe_name(base: &str) -> String {
@@ -51,89 +54,70 @@ fn which(exe: &str) -> Option<PathBuf> {
     None
 }
 
-/// L'archive à récupérer pour cette machine, si l'application en connaît une.
-///
-/// Même version que le runtime géré par l'hôte (`b11003`), pour que les deux
-/// composants restent compatibles s'ils venaient à coexister. La variante
-/// choisie est Vulkan — elle calcule sur GPU NVIDIA, AMD et Intel sans
-/// exiger un jeu d'outils propre à un fabricant ; une machine avec son propre
-/// llama.cpp compilé pour CUDA ou ROCm est trouvée avant d'en arriver là
-/// (voir [`find_binary`]).
-///
-/// L'installateur natif de l'application demandait, pour Linux, une archive
-/// `.zip` qui n'existe plus sous ce nom — seule une `.tar.gz` est publiée ;
-/// corrigé côté hôte le 16/09/2026 (`services/provider-supervisor`). Cette
-/// fonction utilise la bonne extension par plateforme depuis le début, ce
-/// qui l'avait rendue indépendante du bogue.
-pub fn release_url() -> Option<&'static str> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-    match (os, arch) {
-        ("windows", _) => Some(
-            "https://github.com/ggml-org/llama.cpp/releases/download/b11003/llama-b11003-bin-win-vulkan-x64.zip",
-        ),
-        ("linux", "x86_64") => Some(
-            "https://github.com/ggml-org/llama.cpp/releases/download/b11003/llama-b11003-bin-ubuntu-vulkan-x64.tar.gz",
-        ),
-        ("linux", "aarch64") => Some(
-            "https://github.com/ggml-org/llama.cpp/releases/download/b11003/llama-b11003-bin-ubuntu-vulkan-arm64.tar.gz",
-        ),
-        ("macos", "aarch64") => Some(
-            "https://github.com/ggml-org/llama.cpp/releases/download/b11003/llama-b11003-bin-macos-arm64.tar.gz",
-        ),
-        ("macos", "x86_64") => Some(
-            "https://github.com/ggml-org/llama.cpp/releases/download/b11003/llama-b11003-bin-macos-x64.tar.gz",
-        ),
-        _ => None,
-    }
-}
+/// Où en est un téléchargement : le fichier en cours et les octets reçus.
+pub type Progress = dyn Fn(&str, u64) + Send + Sync;
 
-/// Télécharge et pose l'archive dans le dossier privé de l'extension, à
-/// plat — les deux binaires qui nous intéressent et leurs bibliothèques
-/// partagées côte à côte, quel que soit le sous-dossier où l'archive les
-/// range à l'origine.
-pub async fn install(http: &reqwest::Client) -> Result<(), String> {
-    let url = release_url().ok_or_else(|| {
+/// Installe la variante `backend` de llama.cpp dans le dossier privé de
+/// l'extension, à la place de celle qui y était.
+///
+/// L'installation se fait dans un dossier voisin, vérifiée, puis échangée avec
+/// l'ancien : un téléchargement interrompu ou une archive incomplète laisse la
+/// variante précédente intacte. Deux variantes **mélangées** dans un même
+/// dossier chargeraient la même carte deux fois (CUDA et Vulkan), d'où
+/// l'échange entier plutôt qu'un dépôt par-dessus.
+pub async fn install_backend(backend: Backend, progress: &Progress) -> Result<(), String> {
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    let fichiers = backend::assets(backend, os, arch).ok_or_else(|| {
         format!(
-            "aucune archive connue pour {}/{} — installez llama.cpp vous-même et assurez-vous \
-             que « llama-server » et « ggml-rpc-server » sont sur le chemin",
-            std::env::consts::OS,
-            std::env::consts::ARCH
+            "llama.cpp ne publie pas de variante « {} » pour {os}/{arch}",
+            backend.label()
         )
     })?;
-    let dest = crate::vendor_dir();
-    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
 
-    let reponse = http
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("téléchargement de {url} impossible : {e}"))?;
-    if !reponse.status().is_success() {
-        return Err(format!("{url} a répondu {}", reponse.status()));
+    let final_dir = crate::vendor_dir();
+    let staging = final_dir.with_file_name("llama.installation");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+
+    let resultat = installer_dans(&staging, backend, &fichiers, progress).await;
+    if let Err(e) = resultat {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
     }
-    let corps = reponse
-        .bytes()
-        .await
-        .map_err(|e| format!("téléchargement interrompu : {e}"))?;
 
-    let temp = dest.join(format!(
-        "archive.{}",
-        if url.ends_with(".zip") {
+    if final_dir.exists() {
+        std::fs::remove_dir_all(&final_dir).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging);
+            format!(
+                "impossible de remplacer les binaires actuels ({e}) — arrêtez le partage de la                  carte (cluster_worker_stop) puis réessayez"
+            )
+        })?;
+    }
+    std::fs::rename(&staging, &final_dir).map_err(|e| e.to_string())
+}
+
+async fn installer_dans(
+    dest: &Path,
+    backend: Backend,
+    fichiers: &[String],
+    progress: &Progress,
+) -> Result<(), String> {
+    for fichier in fichiers {
+        let extension = if fichier.ends_with(".zip") {
             "zip"
         } else {
             "tar.gz"
-        }
-    ));
-    std::fs::write(&temp, &corps).map_err(|e| e.to_string())?;
-
-    let resultat = if url.ends_with(".zip") {
-        extraire_zip(&temp, &dest)
-    } else {
-        extraire_tar_gz(&temp, &dest).await
-    };
-    let _ = std::fs::remove_file(&temp);
-    resultat?;
+        };
+        let temp = dest.join(format!("telechargement.{extension}"));
+        telecharger(&backend::asset_url(fichier), &temp, fichier, progress).await?;
+        let resultat = if extension == "zip" {
+            extraire_zip(&temp, dest)
+        } else {
+            extraire_tar_gz(&temp, dest).await
+        };
+        let _ = std::fs::remove_file(&temp);
+        resultat?;
+    }
 
     #[cfg(unix)]
     {
@@ -146,13 +130,69 @@ pub async fn install(http: &reqwest::Client) -> Result<(), String> {
         }
     }
 
-    if find_binary("llama-server").is_none() {
-        return Err(format!(
-            "l'archive a été dépliée dans {} mais ne contenait pas llama-server",
-            dest.display()
-        ));
+    // Les deux programmes servent : `llama-server` pour répondre, `ggml-rpc-server`
+    // pour prêter sa carte. Une archive qui n'en a qu'un est refusée ici, avant
+    // de remplacer quoi que ce soit.
+    for nom in ["llama-server", "ggml-rpc-server"] {
+        if !dest.join(exe_name(nom)).is_file() {
+            return Err(format!(
+                "l'archive « {} » ne contenait pas {nom}",
+                backend.label()
+            ));
+        }
     }
-    Ok(())
+    backend::write_marker(dest, backend).map_err(|e| e.to_string())
+}
+
+/// Télécharge avec `curl`, présent sur Windows 10+, Linux et macOS : ce paquet
+/// n'embarque volontairement aucune pile TLS (voir `Cargo.toml`), et tout ce
+/// qu'il appelle par HTTP est en boucle locale — sauf ce téléchargement.
+async fn telecharger(url: &str, dest: &Path, nom: &str, progress: &Progress) -> Result<(), String> {
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "--fail",
+        "--location",
+        "--silent",
+        "--show-error",
+        "--retry",
+        "3",
+        "--connect-timeout",
+        "20",
+        "--output",
+    ])
+    .arg(dest)
+    .arg(url)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    hide_console(&mut cmd);
+    let mut enfant = cmd
+        .spawn()
+        .map_err(|e| format!("« curl » introuvable ({e}) : il sert à télécharger llama.cpp"))?;
+
+    loop {
+        tokio::select! {
+            statut = enfant.wait() => {
+                let statut = statut.map_err(|e| e.to_string())?;
+                if statut.success() {
+                    progress(nom, std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0));
+                    return Ok(());
+                }
+                let mut erreur = String::new();
+                if let Some(mut flux) = enfant.stderr.take() {
+                    let _ = flux.read_to_string(&mut erreur).await;
+                }
+                return Err(format!(
+                    "téléchargement de {nom} impossible ({statut}) : {}",
+                    erreur.trim()
+                ));
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(400)) => {
+                progress(nom, std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0));
+            }
+        }
+    }
 }
 
 fn extraire_zip(archive: &Path, dest: &Path) -> Result<(), String> {
@@ -231,29 +271,5 @@ pub fn hide_console(cmd: &mut Command) {
     #[cfg(not(windows))]
     {
         let _ = cmd;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// L'extension de l'archive doit correspondre à ce que la plateforme
-    /// publie réellement : Windows en `.zip`, tout le reste en `.tar.gz`.
-    /// C'est précisément l'inverse de ce que demande l'installateur natif
-    /// pour Linux aujourd'hui (URL `.zip` vérifiée en 404 — seule la
-    /// `.tar.gz` existe) ; ce test fige la bonne réponse pour cette
-    /// extension.
-    #[test]
-    fn l_extension_de_l_archive_correspond_a_ce_que_la_plateforme_publie() {
-        let Some(url) = release_url() else {
-            return; // plateforme non prise en charge : rien à vérifier ici
-        };
-        let attendu_zip = std::env::consts::OS == "windows";
-        assert_eq!(
-            url.ends_with(".zip"),
-            attendu_zip,
-            "extension incohérente pour {url}"
-        );
     }
 }

@@ -23,8 +23,10 @@
 
 use locaryn_plugin_cluster as cluster;
 use locaryn_plugin_cluster::agent_protocol::{
-    self, AgentHandle, AgentRequest, AgentResponse, MemberView, SharedModelView, SyncEntry,
+    self, AgentHandle, AgentRequest, AgentResponse, BackendJob, BackendStatus, MemberView,
+    SharedModelView, SyncEntry,
 };
+use locaryn_plugin_cluster::backend::{self, Backend, Hardware};
 use locaryn_plugin_cluster::catalog::{self, Catalog, LocalState, SharedModel, SyncLedger};
 use locaryn_plugin_cluster::discovery::{
     Beacon, CapabilityAnnounce, ControlRequest, ControlResponse,
@@ -81,6 +83,13 @@ struct Agent {
     /// Réveille la synchronisation dès qu'un choix change, sans attendre le
     /// prochain passage.
     wake: Arc<Notify>,
+    /// L'installation de backend en cours, ou la dernière terminée. Un verrou
+    /// synchrone : la progression est écrite depuis une fermeture qui ne peut
+    /// pas attendre.
+    backend_job: Arc<std::sync::Mutex<Option<BackendJob>>>,
+    /// La lecture du matériel prend une ou deux secondes (`nvidia-smi`,
+    /// PowerShell) : faite une fois, gardée.
+    hardware: Arc<tokio::sync::OnceCell<Hardware>>,
 }
 
 #[tokio::main]
@@ -112,6 +121,8 @@ async fn main() {
             hashing: HashSet::new(),
         })),
         wake: Arc::new(Notify::new()),
+        backend_job: Arc::new(std::sync::Mutex::new(None)),
+        hardware: Arc::new(tokio::sync::OnceCell::new()),
     };
 
     // Canal local : boucle locale, port choisi par le système. Le serveur MCP
@@ -291,6 +302,17 @@ async fn handle_local_request(req: AgentRequest, agent: &Agent) -> AgentResponse
             }
             state.lock().await.routing = routing;
             AgentResponse::Routing { split_models }
+        }
+        AgentRequest::BackendStatus => AgentResponse::Backend {
+            status: backend_status(agent).await,
+        },
+        AgentRequest::BackendInstall { backend } => {
+            match start_backend_install(agent, backend).await {
+                Ok(()) => AgentResponse::Backend {
+                    status: backend_status(agent).await,
+                },
+                Err(message) => AgentResponse::Error { message },
+            }
         }
         AgentRequest::Bench { peer_id } => bench_peer(&peer_id, state).await,
         AgentRequest::Enroll => enroll(state).await,
@@ -650,6 +672,134 @@ async fn stop_worker(state: &Shared) -> AgentResponse {
 }
 
 // ============================================================================
+// Backend de llama.cpp : ce qui est installé, ce qui conviendrait, et
+// l'installation en tâche de fond.
+// ============================================================================
+
+async fn hardware(agent: &Agent) -> Hardware {
+    agent.hardware.get_or_init(backend::detect).await.clone()
+}
+
+async fn backend_status(agent: &Agent) -> BackendStatus {
+    let hw = hardware(agent).await;
+    let recommended = backend::recommended(&hw);
+    let vendor = cluster::vendor_dir();
+    let installed = backend::read_marker(&vendor).map(|m| m.backend);
+    let in_use = cluster::launch::find_binary("llama-server");
+    let in_use_is_own = in_use.as_ref().is_some_and(|p| p.starts_with(&vendor));
+    let loaded_backend = agent
+        .state
+        .lock()
+        .await
+        .devices
+        .iter()
+        .find(|d| !d.is_cpu())
+        .map(RpcDevice::backend_name);
+    let recommended_mb = backend::approx_download_mb(recommended, &hw.os, &hw.arch);
+
+    // Une suggestion seulement quand le backend recommandé est spécifique à la
+    // machine (CUDA, Adreno, processeur ARM) et que ce n'est pas lui qui
+    // tourne : Vulkan, lui, est déjà ce que l'application embarque.
+    let specifique = matches!(
+        recommended,
+        Backend::Cuda12 | Backend::Cuda13 | Backend::Adreno | Backend::Cpu
+    );
+    let installed_name = installed.map(|b| b.name().to_string());
+    let suggestion = (specifique && installed != Some(recommended)).then(|| {
+        format!(
+            "Cette machine peut utiliser {}{} : installez-le avec cluster_backend_install.",
+            recommended.label(),
+            recommended_mb
+                .map(|mb| format!(" (≈ {mb} Mo à télécharger)"))
+                .unwrap_or_default()
+        )
+    });
+
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(n) = recommended.note() {
+        notes.push(n.to_string());
+    }
+    if hw.intel_npu {
+        notes.push(
+            "Un NPU Intel est présent : OpenVINO peut l'utiliser \
+             (cluster_backend_install avec backend=openvino), mais c'est expérimental."
+                .to_string(),
+        );
+    }
+
+    BackendStatus {
+        hardware: hw,
+        recommended: recommended.name().to_string(),
+        recommended_label: recommended.label().to_string(),
+        recommended_mb,
+        installed: installed_name,
+        in_use_path: in_use.map(|p| p.display().to_string()),
+        in_use_is_own,
+        loaded_backend,
+        suggestion,
+        note: (!notes.is_empty()).then(|| notes.join(" ")),
+        job: agent.backend_job.lock().ok().and_then(|j| j.clone()),
+    }
+}
+
+/// Lance l'installation d'un backend et rend la main aussitôt : le panneau
+/// suit l'avancement par `BackendStatus`.
+async fn start_backend_install(agent: &Agent, nom: Option<String>) -> Result<(), String> {
+    let hw = hardware(agent).await;
+    let choisi = match nom.as_deref() {
+        None => backend::recommended(&hw),
+        Some(n) => backend::resolve(n, &hw)?,
+    };
+
+    {
+        let mut job = agent.backend_job.lock().map_err(|e| e.to_string())?;
+        if job.as_ref().is_some_and(|j| j.state == "downloading") {
+            return Err("une installation est déjà en cours".to_string());
+        }
+        *job = Some(BackendJob {
+            backend: choisi.name().to_string(),
+            file: String::new(),
+            received_mb: 0,
+            state: "downloading".to_string(),
+            error: None,
+        });
+    }
+
+    let agent = agent.clone();
+    tokio::spawn(async move {
+        // Sous Windows, un programme lancé garde ses fichiers verrouillés : le
+        // serveur RPC prêté est arrêté le temps de l'échange, puis relancé.
+        stop_worker(&agent.state).await;
+
+        let suivi = agent.backend_job.clone();
+        let progression = move |fichier: &str, octets: u64| {
+            if let Ok(mut job) = suivi.lock() {
+                if let Some(j) = job.as_mut() {
+                    j.file = fichier.to_string();
+                    j.received_mb = (octets / 1_048_576) as u32;
+                }
+            }
+        };
+        let resultat = cluster::launch::install_backend(choisi, &progression).await;
+
+        if let Ok(mut job) = agent.backend_job.lock() {
+            if let Some(j) = job.as_mut() {
+                match &resultat {
+                    Ok(()) => j.state = "done".to_string(),
+                    Err(e) => {
+                        j.state = "error".to_string();
+                        j.error = Some(e.clone());
+                    }
+                }
+            }
+        }
+        refresh_devices(&agent.state).await;
+        apply_prefs(&agent.state).await;
+    });
+    Ok(())
+}
+
+// ============================================================================
 // Capacités locales : GPU, VRAM libre, présence des binaires llama.cpp.
 // ============================================================================
 
@@ -678,6 +828,10 @@ async fn local_capability(state: &Shared) -> Capability {
         total_ram_gb,
         free_ram_gb,
         cpu_usage_percent,
+        backend: devices
+            .iter()
+            .find(|d| !d.is_cpu())
+            .map(RpcDevice::backend_name),
     }
 }
 
@@ -838,6 +992,7 @@ async fn shared_models_view(state: &Shared) -> AgentResponse {
                 free_ram_gb: p.capability.free_ram_gb,
                 total_ram_gb: p.capability.total_ram_gb,
                 cpu_usage_percent: p.capability.cpu_usage_percent,
+                backend: p.capability.backend.clone(),
             }
         })
         .collect();
@@ -863,6 +1018,7 @@ async fn shared_models_view(state: &Shared) -> AgentResponse {
         free_ram_gb: local_cap.free_ram_gb,
         total_ram_gb: local_cap.total_ram_gb,
         cpu_usage_percent: local_cap.cpu_usage_percent,
+        backend: local_cap.backend.clone(),
     });
     members.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     AgentResponse::SharedModels {

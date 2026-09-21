@@ -85,6 +85,48 @@ des modèles »** (« Découper un gros modèle sur plusieurs machines »), ou p
 l'outil `cluster_routing_set`. `cluster_launch_plan` montre ce que le lancement
 ferait d'un modèle donné, sans le lancer.
 
+## Le bon backend pour votre matériel
+
+llama.cpp publie un binaire par matériel. Ce morph lit la machine et propose le
+meilleur, **sans jamais l'installer sans vous le dire** : c'est un téléchargement
+de plusieurs centaines de Mo.
+
+| Matériel détecté | Backend recommandé | Téléchargement |
+|---|---|---|
+| Carte NVIDIA, pilote annonçant CUDA ≥ 13.4 (Windows) / 13.3 (Linux) | CUDA 13 | ≈ 546 Mo (Windows) |
+| Carte NVIDIA, pilote annonçant CUDA 12.4 (Windows) / 12.8 (Linux) | CUDA 12 | ≈ 615 Mo (Windows) |
+| Autre carte (AMD, Intel, NVIDIA trop ancien), PC x86 ou Linux ARM64 | Vulkan | ≈ 30 Mo |
+| Windows sur Snapdragon avec GPU Adreno | OpenCL Adreno | ≈ 12 Mo |
+| Windows sur Snapdragon sans Adreno | Processeur ARM64 | ≈ 11 Mo |
+| Mac | Metal | ≈ 10 Mo |
+
+Le choix se lit dans Réglages → Compte → Partage de ressources → « Accélération
+du calcul », ou par `cluster_backend_status` ; `cluster_backend_install`
+l'installe (téléchargement avec `curl`, archive vérifiée avant de remplacer
+l'ancienne variante, qui reste intacte en cas d'échec). `LOCARYN_CLUSTER_BACKEND`
+impose un backend (`cuda`, `vulkan`, `cpu`, `openvino`, `adreno`).
+
+**Ce que ça change — mesuré, pas promis.** Sur une RTX 4050 6 Go avec Gemma 4
+E2B Q4_0 (`llama-bench`, mêmes réglages, llama.cpp b11003) :
+
+| Backend | Lecture du prompt (pp512) | Génération (tg128) |
+|---|---:|---:|
+| Vulkan | 3 825 ± 40 t/s | 82,8 ± 4,2 t/s |
+| CUDA 13.4 | 4 110 ± 453 t/s | 92,9 ± 3,1 t/s |
+
+Le gain est réel mais **modeste — environ 12 % en génération** sur ce petit
+modèle et cette carte. Il peut être plus net sur un modèle plus gros ou une carte
+plus puissante ; à mesurer avant de télécharger un demi-gigaoctet pour ça.
+
+### Et les NPU ?
+
+Seul le **NPU Intel** a un binaire prêt (backend OpenVINO, ≈ 76 Mo). Il est
+**expérimental** dans llama.cpp : mode sans état, quantification Q4_0 surtout,
+validé sur Core Ultra série 1 et 2. Il n'est donc **jamais choisi tout seul** :
+`cluster_backend_install` avec `backend=openvino`, pour un essai. Le NPU Qualcomm
+(Hexagon) demande de compiler llama.cpp soi-même avec le SDK Hexagon — aucun
+binaire n'est publié. Apple Neural Engine et AMD XDNA ne sont pas pris en charge.
+
 ### À venir : répartir des requêtes indépendantes (nécessitera `morph-omniroute`)
 
 Un modèle entier sur une machine ne profite pas des autres. Pour utiliser
@@ -170,8 +212,9 @@ comportement.
 
 - **llama.cpp** avec le backend RPC (`llama-server` + `ggml-rpc-server`),
   cherché dans le dossier privé de l'extension, puis dans `bin/llama/` de
-  l'application, puis sur le chemin du système ; à défaut, l'archive Vulkan
-  officielle est téléchargée pour Windows, Linux x86_64 et ARM64, et macOS.
+  l'application, puis sur le chemin du système. Le dossier de l'extension passe
+  en premier : un backend installé ici (CUDA par exemple) l'emporte sur la
+  variante Vulkan de l'application.
 - **Réseau** : TCP `41338` entre les machines (contrôle et copie des modèles),
   UDP `41337` pour la découverte, et le port RPC tiré au hasard.
 - **Locaryn 0.3.78 ou plus récent** pour le panneau de compte, l'inscription

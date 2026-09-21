@@ -31,6 +31,7 @@ use std::path::PathBuf;
 
 pub mod agent_client;
 pub mod agent_protocol;
+pub mod backend;
 pub mod catalog;
 pub mod discovery;
 pub mod hmac_auth;
@@ -123,6 +124,12 @@ pub struct Capability {
     /// réelle, une valeur absente.
     #[serde(default)]
     pub cpu_usage_percent: f32,
+    /// Le backend de calcul réellement chargé sur cette machine (`CUDA`,
+    /// `Vulkan`, `Metal`…), lu dans la liste d'appareils de llama.cpp : ce que
+    /// la machine fait, pas ce qu'on avait prévu d'installer. `None` tant que
+    /// la liste n'a pas été lue, ou chez un ancien pair qui ne l'annonce pas.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 impl Capability {
@@ -240,6 +247,7 @@ mod tests {
             total_ram_gb: 32.0,
             free_ram_gb: 16.0,
             cpu_usage_percent: 0.0,
+            backend: None,
         };
         assert!(!cap.can_serve());
     }
@@ -261,6 +269,7 @@ mod tests {
             total_ram_gb: 32.0,
             free_ram_gb: 16.0,
             cpu_usage_percent: 0.0,
+            backend: None,
         };
         assert!(cap.can_serve());
         assert_eq!(cap.lendable_gb(), 12.0);

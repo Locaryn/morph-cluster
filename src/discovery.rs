@@ -121,6 +121,7 @@ mod tests {
             total_ram_gb: 32.0,
             free_ram_gb: 16.0,
             cpu_usage_percent: 0.0,
+            backend: None,
         }
     }
 

@@ -1,6 +1,6 @@
 # morph-cluster
 
-Extension Locaryn qui fait **travailler ensemble les machines d'un même
+Morph Locaryn qui fait **travailler ensemble les machines d'un même
 réseau**. Chaque poste connecté au serveur Locaryn peut prêter sa carte
 graphique, sa mémoire vive et de la place disque. Deux usages :
 
@@ -13,7 +13,7 @@ graphique, sa mémoire vive et de la place disque. Deux usages :
 
 Le calcul est fait par **llama.cpp** lui-même : `ggml-rpc-server` sur les
 machines qui prêtent leurs ressources, `llama-server --rpc host:port,…` sur
-celle qui pilote la conversation. Cette extension ajoute tout ce qui manquait
+celle qui pilote la conversation. Ce morph ajoute tout ce qui manquait
 autour : l'inscription des postes par le compte Locaryn, le choix de ce que
 chaque machine prête, le catalogue des modèles partagés, leur copie vérifiée,
 et la répartition au démarrage du moteur.
@@ -29,7 +29,7 @@ ressources** ; aucun code n'est à recopier.
    comptes créés. Le panneau « Partage de ressources » de cette machine liste
    sa bibliothèque de modèles, avec un interrupteur par modèle.
 2. **Sur chaque poste client** : se connecter au serveur avec son compte.
-   L'extension est un *compagnon d'appareil* — elle doit tourner sur le poste
+   Le morph est un *compagnon d'appareil* — il doit tourner sur le poste
    pour agir sur lui. Le panneau propose de l'installer ici, avec ses
    autorisations.
 3. **Cocher « Allouer cette machine au partage de ressources »**. Le poste
@@ -171,7 +171,7 @@ comportement.
   seule » sur une machine sans carte est refusé plutôt que de laisser llama.cpp
   se rabattre en silence sur le processeur.
 - **Cache de tenseurs** : sur un poste qui héberge des modèles, `ggml-rpc-server`
-  tourne avec `-c`, son cache rangé dans le dossier de l'extension et non sur
+  tourne avec `-c`, son cache rangé dans le dossier du morph et non sur
   le disque système.
 
 ---
@@ -192,7 +192,7 @@ comportement.
   de llama.cpp : tant qu'il tourne, n'importe qui capable d'atteindre son port
   peut lui parler. Il écoute sur un port tiré au hasard, communiqué seulement
   après authentification, et seulement sur une machine dont la personne a
-  coché le partage — mais **cette extension n'invente pas une sécurité qui
+  coché le partage — mais **ce morph n'invente pas une sécurité qui
   n'existe pas en amont**. À réserver à un réseau de confiance.
 
 ---
@@ -201,7 +201,7 @@ comportement.
 
 | Protocole | État |
 |---|---|
-| **llama.cpp RPC** (`ggml-rpc-server`) | ✅ implémenté — c'est ce que cette extension utilise |
+| **llama.cpp RPC** (`ggml-rpc-server`) | ✅ implémenté — c'est ce que ce morph utilise |
 | Exo (exo-explore) | 📋 à l'étude, aucun code |
 | vLLM multi-nœud (Ray + NCCL) | 📋 à l'étude, aucun code |
 | Petals / hivemind (DHT) | 📋 à l'étude, aucun code |
@@ -211,8 +211,8 @@ comportement.
 ## Ce que la machine doit offrir
 
 - **llama.cpp** avec le backend RPC (`llama-server` + `ggml-rpc-server`),
-  cherché dans le dossier privé de l'extension, puis dans `bin/llama/` de
-  l'application, puis sur le chemin du système. Le dossier de l'extension passe
+  cherché dans le dossier privé du morph, puis dans `bin/llama/` de
+  l'application, puis sur le chemin du système. Le dossier du morph passe
   en premier : un backend installé ici (CUDA par exemple) l'emporte sur la
   variante Vulkan de l'application.
 - **Réseau** : TCP `41338` entre les machines (contrôle et copie des modèles),

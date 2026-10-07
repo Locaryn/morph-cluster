@@ -5,17 +5,17 @@ description: Mettre en commun la VRAM de plusieurs machines pour faire tourner u
 
 # Le cluster GPU
 
-Cette extension répartit un modèle **GGUF** entre plusieurs machines, par le
+Ce morph répartit un modèle **GGUF** entre plusieurs machines, par le
 mécanisme RPC natif de llama.cpp (`ggml-rpc-server`). Une machine « pilote »
 la conversation (le moteur « Cluster GPU », choisi dans Réglages → Moteur) ;
 les autres prêtent leur GPU. C'est ce qui permet à un modèle de 16 Go de
 tourner sur deux cartes de 8 Go — à condition que les deux machines soient sur
 le même cluster.
 
-## Ce qui appartient à cette extension, et ce qui n'y appartient pas
+## Ce qui appartient à ce morph, et ce qui n'y appartient pas
 
 Le **choix du modèle et le démarrage du moteur** ne sont pas des outils : ils
-appartiennent à Réglages → Moteur, comme pour tout moteur d'extension. Ces
+appartiennent à Réglages → Moteur, comme pour tout moteur de morph. Ces
 outils servent à préparer et surveiller le cluster **avant** de choisir ce
 moteur — pas à le piloter à sa place.
 
@@ -93,13 +93,13 @@ serveur RPC.
   (secret partagé, poignée de main HMAC) garantit que seule une machine qui
   connaît le secret devient un pair reconnu. Mais une fois qu'un pair a
   démarré `ggml-rpc-server`, ce programme de llama.cpp — pas cette
-  extension — n'a pas d'authentification à son bord : n'importe qui capable
+  morph — n'a pas d'authentification à son bord : n'importe qui capable
   d'atteindre son port pendant qu'il tourne peut lui parler. À réserver à un
   réseau de confiance (réseau domestique, propre VPN de l'utilisateur) — ne
   jamais présenter ceci comme sûr sur un réseau partagé ou public.
 - **Un pair est une adresse `hôte:port`.** Comment cette adresse est devenue
-  joignable — réseau local, VPN, tunnel — ne regarde pas cette extension, et
-  elle ne sait rien d'une éventuelle extension d'accès distant installée à
+  joignable — réseau local, VPN, tunnel — ne regarde pas ce morph, et
+  il ne sait rien d'un éventuel morph d'accès distant installé à
   côté. Si la découverte automatique ne trouve rien (réseaux séparés), il n'y
   a pour l'instant pas d'entrée manuelle d'adresse — dites-le plutôt que de
   laisser croire qu'un contournement existe.
@@ -108,7 +108,7 @@ serveur RPC.
   une option disponible. N'annoncez jamais qu'ils fonctionnent ; appelez
   `cluster_protocols` si l'utilisateur en demande un et répondez avec ce que
   cet outil renvoie, pas de mémoire.
-- **Cette extension n'a pas été testée sur un vrai cluster de plusieurs
+- **Ce morph n'a pas été testé sur un vrai cluster de plusieurs
   machines physiques dans son environnement de développement.** La logique de
   pairage, de calcul de répartition et de format des messages est
   intégralement testée ; l'échange réseau réel entre deux machines ne l'a pas
